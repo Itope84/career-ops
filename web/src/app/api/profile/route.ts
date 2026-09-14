@@ -3,6 +3,7 @@ import path from "node:path";
 import yaml from "js-yaml";
 import { careerOpsRoot } from "@/lib/career-ops";
 import { atomicWriteWithBackup } from "@/lib/core/safe-write";
+import { applyCompensation, type CompensationInput } from "@/lib/compensation";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -21,6 +22,11 @@ type ProfilePatch = {
   target_range?: string;
   currency?: string;
   remote?: string;
+  /** Canonical salary numbers from the UI. `cutoff` is the only one any gate
+   *  reads; the range pair is display. See lib/compensation.ts. */
+  cutoff?: number | null;
+  range_min?: number | null;
+  range_max?: number | null;
   archetypes?: any[];
   headline?: string;
   exit_story?: string;
@@ -63,7 +69,9 @@ function patchToProfile(p: ProfilePatch): Record<string, unknown> {
   if (Object.keys(narrative).length) out.narrative = narrative;
 
   const comp: Record<string, unknown> = {};
-  if (p.target_range) comp.target_range = p.target_range;
+  // target_range is DERIVED from the range pair (see lib/compensation.ts) and
+  // is only accepted raw for older clients that still post it on its own.
+  if (p.target_range && p.cutoff == null && p.range_min == null) comp.target_range = p.target_range;
   if (p.currency) comp.currency = p.currency;
   if (p.remote) comp.location_flexibility = p.remote;
   if (Object.keys(comp).length) out.compensation = comp;
@@ -107,6 +115,22 @@ export async function POST(req: Request) {
   }
 
   const merged = deepMerge(base, proposed);
+
+  // Compensation is applied AFTER the merge, not through it: one edit has to
+  // reach `minimum`, `target_range` and every markets[] entry at once, and a
+  // key-by-key deep merge cannot express "regenerate the derived strings from
+  // these three numbers" (that is exactly how the UI ended up moving a label
+  // while every real gate kept the old figure).
+  const compTouched = patch.cutoff != null || patch.range_min != null || patch.range_max != null;
+  if (compTouched) {
+    merged.compensation = applyCompensation(merged.compensation as Record<string, unknown> | undefined, {
+      cutoff: patch.cutoff ?? null,
+      rangeMin: patch.range_min ?? null,
+      rangeMax: patch.range_max ?? null,
+      currency: patch.currency || ((merged.compensation as Record<string, unknown>)?.currency as string) || "EUR",
+    } satisfies CompensationInput);
+  }
+
   try {
     // Back up the prior profile before the first normalized write (yaml.dump
     // reformats — comments are not preserved; the .bak is the safety net).
@@ -114,7 +138,42 @@ export async function POST(req: Request) {
   } catch (e) {
     return Response.json({ error: e instanceof Error ? e.message : "write failed" }, { status: 500 });
   }
-  return Response.json({ ok: true, seeded });
+
+  // portals.yml is a SEPARATE file the profile editor never used to touch, and
+  // its salary_filter.min is what drops postings at scan time — before they can
+  // ever reach the inbox. Leaving it behind is what made a UI change look like
+  // it had done nothing. Best-effort: a profile save must still succeed if
+  // portals.yml is missing or hand-broken.
+  let portalsUpdated = false;
+  if (compTouched && patch.cutoff != null) {
+    portalsUpdated = syncPortalsSalaryFloor(root, patch.cutoff, patch.currency);
+  }
+
+  return Response.json({ ok: true, seeded, portalsUpdated });
+}
+
+/**
+ * Mirror the cutoff into portals.yml's `salary_filter.min`.
+ *
+ * NOTE `max` is intentionally untouched. In scan.mjs's `buildSalaryFilter`,
+ * max is an UPPER bound — postings paying more than it are filtered out — so
+ * deriving it from a target-range ceiling would quietly bin the best-paying
+ * roles. It stays whatever a human set (0 = no upper limit).
+ */
+function syncPortalsSalaryFloor(root: string, cutoff: number, currency?: string): boolean {
+  const portalsPath = path.join(root, "portals.yml");
+  if (!fs.existsSync(portalsPath)) return false;
+  try {
+    const parsed = yaml.load(fs.readFileSync(portalsPath, "utf8"));
+    if (!isObj(parsed)) return false;
+    const filter: Record<string, unknown> = isObj(parsed.salary_filter) ? { ...parsed.salary_filter } : { max: 0 };
+    filter.min = Math.round(cutoff);
+    if (currency) filter.currency = currency.trim().toUpperCase();
+    atomicWriteWithBackup(portalsPath, yaml.dump({ ...parsed, salary_filter: filter }, { lineWidth: 100, noRefs: true }));
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 export async function GET() {

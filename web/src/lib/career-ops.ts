@@ -1,3 +1,4 @@
+import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import yaml from "js-yaml";
@@ -26,6 +27,19 @@ export function careerOpsRoot(): string {
  */
 export function rootScript(nameNoExt: string): string {
   return path.join(careerOpsRoot(), `${nameNoExt}.mjs`);
+}
+
+/**
+ * Whether the raw worker debug surfaces (sidebar "Workers" panel, /jobs
+ * history — the tool-by-tool transcript) should render. Off by default: that
+ * detail is for debugging the CLI integration itself, not day-to-day use.
+ * Set DEBUG_ENABLED=true in web/.env.local to turn it on. Read at request
+ * time (not baked in via NEXT_PUBLIC_) so toggling it needs a server restart,
+ * not a rebuild.
+ */
+export function debugEnabled(): boolean {
+  const v = process.env.DEBUG_ENABLED?.trim().toLowerCase();
+  return v === "true" || v === "1";
 }
 
 // Feature-detect the core's `tracker.mjs delete --num` row-delete (#1200) by probing
@@ -72,6 +86,31 @@ export function readInbox(): InboxJob[] {
     });
   }
   return jobs;
+}
+
+export type ShortlistItem = { url: string; company: string; role: string };
+
+/**
+ * Parse data/pipeline.md's `## Shortlisted` section — plain bullets
+ * (`- {url} | {company} | {role}`), deliberately NOT `- [ ]`/`- [x]`
+ * checkboxes so readInbox()'s whole-file checkbox sweep above never picks
+ * them up. Written by shortlist-entries.mjs (add/remove) under the same
+ * pipeline.md lock every other writer uses.
+ */
+export function readShortlist(): ShortlistItem[] {
+  const md = read("data/pipeline.md");
+  if (!md) return [];
+  const lines = md.split("\n");
+  const start = lines.findIndex((l) => l.trim() === "## Shortlisted");
+  if (start === -1) return [];
+  const items: ShortlistItem[] = [];
+  for (let i = start + 1; i < lines.length; i++) {
+    if (/^##\s/.test(lines[i])) break;
+    const m = lines[i].match(/^-\s+(\S+)\s*\|\s*([^|]+)\|\s*(.+)$/);
+    if (!m) continue;
+    items.push({ url: m[1].trim(), company: m[2].trim(), role: m[3].trim() });
+  }
+  return items;
 }
 
 /**
@@ -189,6 +228,7 @@ export type PipelineSummary = {
   rootExists: boolean;
   inbox: InboxJob[];
   applications: Application[];
+  shortlist: ShortlistItem[];
 };
 
 export function pipelineSummary(): PipelineSummary {
@@ -201,6 +241,7 @@ export function pipelineSummary(): PipelineSummary {
     // triage view orders/faceted-filters on it entirely client-side.
     inbox: readInbox().map((j) => ({ ...j, postedAt: scanDates.get(j.url) })),
     applications: readApplications(),
+    shortlist: readShortlist(),
   };
 }
 
@@ -217,7 +258,15 @@ export function findReportFile(n: string): string | null {
   } catch {
     return null;
   }
-  const match = files.find((f) => f.endsWith(".md") && parseInt(f, 10) === target);
+  // NNN-RESERVED.md is a zero-byte sentinel reserve-report-num.mjs creates to
+  // atomically claim a slot before the real report is written (see its own
+  // header) — it also parses to `target` via parseInt, and can outlive the
+  // real report if whoever reserved it skipped the release step. Without this
+  // exclusion, a stale sentinel alphabetically before the real file (an
+  // uppercase "R" sorts before a lowercase company-slug letter) gets matched
+  // first — readFileSync on it "succeeds" with an empty string, and the UI
+  // shows "No report file found" even though the real report exists (#22).
+  const match = files.find((f) => f.endsWith(".md") && !/-RESERVED\.md$/.test(f) && parseInt(f, 10) === target);
   return match ? path.join(careerOpsRoot(), "reports", match) : null;
 }
 
@@ -267,21 +316,35 @@ export function readMemory(): string {
 /** Optional `opencode_models` block in config/profile.yml — a USER-LAYER,
  *  subscription-specific preference (e.g. OpenCode Go's `provider/model` ids),
  *  not a system default. Absent entirely on a fresh checkout, in which case
- *  the OpenCode CLI just uses whatever model it's already configured with. */
-export function readOpencodeModels(): { default?: string; scan?: string; evaluate?: string; premium?: string } {
+ *  the OpenCode CLI just uses whatever model it's already configured with.
+ *
+ *  Each key can ALSO be overridden with an env var — OPENCODE_MODEL_DEFAULT,
+ *  OPENCODE_MODEL_SCAN, OPENCODE_MODEL_TRIAGE, OPENCODE_MODEL_EVALUATE,
+ *  OPENCODE_MODEL_PREMIUM — read fresh on every call, same as the YAML file,
+ *  so trialling a different model needs neither a rebuild nor a restart: set
+ *  the env var (or edit profile.yml directly — either works, this is purely a
+ *  faster-to-toggle alternative for a short trial), refresh, done; unset it
+ *  to fall straight back to whatever profile.yml already says. The env var
+ *  wins when both are set. */
+export function readOpencodeModels(): { default?: string; scan?: string; triage?: string; evaluate?: string; premium?: string } {
+  const out: Record<string, string> = {};
   try {
     const parsed = yaml.load(fs.readFileSync(path.join(careerOpsRoot(), "config", "profile.yml"), "utf8"));
     const models = (parsed as Record<string, unknown> | null)?.opencode_models;
-    if (!models || typeof models !== "object") return {};
-    const out: Record<string, string> = {};
-    for (const key of ["default", "scan", "evaluate", "premium"]) {
-      const v = (models as Record<string, unknown>)[key];
-      if (typeof v === "string" && v.trim()) out[key] = v.trim();
+    if (models && typeof models === "object") {
+      for (const key of ["default", "scan", "triage", "evaluate", "premium"]) {
+        const v = (models as Record<string, unknown>)[key];
+        if (typeof v === "string" && v.trim()) out[key] = v.trim();
+      }
     }
-    return out;
   } catch {
-    return {};
+    // no profile.yml, or it's malformed — env var overrides below still apply
   }
+  for (const key of ["default", "scan", "triage", "evaluate", "premium"]) {
+    const envVal = process.env[`OPENCODE_MODEL_${key.toUpperCase()}`]?.trim();
+    if (envVal) out[key] = envVal;
+  }
+  return out;
 }
 
 /** Append a durable fact to the canonical modes/_profile.md (creating the file +
@@ -313,4 +376,20 @@ export function rememberFact(fact: string): "ok" | "deduped" | "error" {
   } catch {
     return "error";
   }
+}
+
+/**
+ * Path to the JD text captured at scan time by jd-capture.mjs, if any.
+ *
+ * The key must match jd-capture.mjs's `jdKey()` exactly — sha1 of the trimmed
+ * URL, first 16 hex chars. That duplication is deliberate (this is TypeScript
+ * in the web app, that is an .mjs script the CLI runs), but it is a coupling:
+ * change one and you MUST change the other, or the app silently stops finding
+ * cached JDs and scoring quietly regresses to re-fetching pages itself.
+ */
+export function jdCachePathFor(url: string): string | null {
+  const key = crypto.createHash("sha1").update(url.trim()).digest("hex").slice(0, 16);
+  const rel = path.join("data", "jd-cache", `${key}.md`);
+  const abs = path.join(careerOpsRoot(), rel);
+  return fs.existsSync(abs) ? rel : null;
 }

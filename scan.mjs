@@ -60,6 +60,11 @@ const PORTALS_PATH = process.env.CAREER_OPS_PORTALS || 'portals.yml';
 const PROFILE_PATH = process.env.CAREER_OPS_PROFILE || 'config/profile.yml';
 const SCAN_HISTORY_PATH = 'data/scan-history.tsv';
 const PIPELINE_PATH = 'data/pipeline.md';
+// Base pause between JD-capture page loads (jittered, like the liveness pass).
+// Only the offers that actually reach the inbox are fetched — dozens, not
+// thousands — so a courteous delay costs seconds, and being rate-limited off a
+// board costs the whole scan.
+const JD_CAPTURE_THROTTLE_MS = 1500;
 const APPLICATIONS_PATH = 'data/applications.md';
 const PROVIDERS_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), 'providers');
 
@@ -1159,6 +1164,99 @@ async function parallelFetch(tasks, limit) {
 
 // ── Main ────────────────────────────────────────────────────────────
 
+/**
+ * Persist the JD text for offers that are about to be written to pipeline.md,
+ * so triage can judge on content instead of a title and scoring can read a
+ * fully rendered page instead of re-fetching one with a plain HTTP tool.
+ *
+ * Three sources, cheapest first:
+ *   1. `offer.renderedText` — free, already in hand from --verify's Playwright pass.
+ *   2. `offer.description`  — free, shipped by some list APIs (Lever's
+ *      descriptionPlain); it was only ever used for a content filter and a
+ *      fingerprint, then dropped.
+ *   3. A render of our own — the fallback, and the only one that costs time.
+ *      Sequential, per the project rule about never driving Playwright in
+ *      parallel. Skipped entirely when Playwright is unavailable: this is an
+ *      enhancement, and a scan must never fail because it couldn't cache a JD.
+ */
+async function captureJdsFor(offers) {
+  let saveJd, hasJd;
+  try {
+    ({ saveJd, hasJd } = await import('./jd-capture.mjs'));
+  } catch {
+    return; // capture is best-effort; never break a scan over it
+  }
+
+  const needRender = [];
+  let free = 0;
+  let alreadyCached = 0;
+  for (const offer of offers) {
+    // Never re-fetch a posting we already hold. The cache is keyed by URL and
+    // a JD does not change materially between scans, so this is what keeps a
+    // re-scan of the same board from being a second crawl of it.
+    if (hasJd(offer.url)) {
+      alreadyCached++;
+      continue;
+    }
+    const text = offer.renderedText || offer.description || '';
+    if (text && saveJd(offer.url, text, { source: offer.renderedText ? 'rendered' : 'api', company: offer.company, role: offer.title })) {
+      free++;
+    } else if (offer.renderedText !== undefined) {
+      // --verify already had this page open and what came back was unusable
+      // (empty body, anti-bot interstitial). Loading it a second time in the
+      // same run would just hit the same wall from the same IP — that is the
+      // double-visit worth avoiding, so leave it uncached and move on.
+    } else {
+      needRender.push(offer);
+    }
+  }
+
+  let rendered = 0;
+  let blocked = 0;
+  if (needRender.length > 0) {
+    let chromium, newLivenessPage, jitteredDelayMs, sleep;
+    try {
+      ({ chromium } = await import('playwright'));
+      ({ newLivenessPage, jitteredDelayMs, sleep } = await import('./liveness-browser.mjs'));
+    } catch {
+      console.log(`JD capture: ${free} free, ${alreadyCached} already cached, ${needRender.length} skipped (Playwright unavailable)`);
+      return;
+    }
+    let browser;
+    try {
+      browser = await chromium.launch({ headless: true });
+      const page = await newLivenessPage(browser);
+      for (let i = 0; i < needRender.length; i++) {
+        const offer = needRender[i];
+        try {
+          await page.goto(offer.url, { waitUntil: 'domcontentloaded', timeout: 30000 });
+          await page.waitForTimeout(2500); // SPA hydration — Workday/Ashby/Lever
+          const text = await page.evaluate(() => document.body?.innerText ?? '');
+          if (saveJd(offer.url, text, { source: 'rendered', company: offer.company, role: offer.title })) rendered++;
+          else blocked++;
+        } catch {
+          blocked++; // one unreachable posting must not abort the rest
+        }
+        // Same courtesy pacing as the liveness pass. Job boards rate-limit by
+        // IP, and this loop hits the same hosts the scan just finished with —
+        // an unthrottled burst here would get the whole scan blocked.
+        if (i < needRender.length - 1) {
+          const wait = jitteredDelayMs(JD_CAPTURE_THROTTLE_MS);
+          if (wait) await sleep(wait);
+        }
+      }
+    } catch {
+      /* browser launch failed — fall through to the summary line */
+    } finally {
+      if (browser) await browser.close();
+    }
+  }
+  console.log(
+    `JD capture: ${free + rendered} newly cached (${free} free, ${rendered} rendered), ` +
+      `${alreadyCached} already cached, ${blocked} unavailable`,
+  );
+}
+
 async function verifyOffers(offers, { headedFallback = false, throttleBaseMs = 0, rediscover = false } = {}) {
   // Dynamic imports keep the default zero-token path free of Playwright startup
   let chromium;
@@ -1209,9 +1307,12 @@ async function verifyOffers(offers, { headedFallback = false, throttleBaseMs = 0
     // Sequential — project rule: never Playwright in parallel
     for (let i = 0; i < offers.length; i++) {
       const offer = offers[i];
-      const { result, code, reason } = headed
+      const { result, code, reason, bodyText } = headed
         ? await checkUrlLivenessWithFallback(page, offer.url, { getHeadedPage })
         : await checkUrlLiveness(page, offer.url);
+      // Free JD text: the page is already open and hydrated. Stash it on the
+      // offer now; step 5.8 persists it for the ones that survive to the inbox.
+      if (bodyText) offer.renderedText = bodyText;
       if (result === 'expired') {
         // 404/410 on a tracked company may just be a moved role — run one
         // search + re-verify before giving up (opt-in via --rediscover-404).
@@ -1230,7 +1331,8 @@ async function verifyOffers(offers, { headedFallback = false, throttleBaseMs = 0
             // 'uncertain' (timeout/DNS/5xx) must not commit an unverified URL —
             // fall through to expired (the original 404/410 is a real closure).
             if (recheck.result === 'active') {
-              migrated.push({ ...offer, url: newUrl, previousUrl: offer.url });
+              // Use the RE-check's text, not the 404 page's, for the new URL.
+              migrated.push({ ...offer, url: newUrl, previousUrl: offer.url, renderedText: recheck.bodyText || '' });
               console.log(`  🔄 migrated  ${offer.company} | ${offer.title} → ${newUrl}`);
               continue;
             }
@@ -1587,6 +1689,13 @@ async function main() {
     offer.fingerprint = fingerprintText(offer.description);
   }
   const crossListings = findCrossListings(verifiedOffers, loadFingerprintHistory());
+
+  // 5.8. Capture the job description for everything about to enter the inbox.
+  // Only these offers — a scan sees thousands of postings and appends dozens,
+  // and nothing downstream ever asks about the ones that were filtered out.
+  if (!dryRun && verifiedOffers.length > 0) {
+    await captureJdsFor(verifiedOffers);
+  }
 
   // 6. Write results
   if (!dryRun && verifiedOffers.length > 0) {

@@ -5,19 +5,23 @@ import Link from "next/link";
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import { Search, ChevronsUpDown, X, Compass, ArrowRight, ExternalLink, Trash2 } from "lucide-react";
 import { ClearConfirmModal } from "@/components/clear-confirm-modal";
-import type { Application, InboxJob } from "@/lib/career-ops";
+import type { Application, InboxJob, ShortlistItem } from "@/lib/career-ops";
 import { Badge } from "@/components/ui/badge";
 import { CompanyLogo } from "@/components/company-logo";
 import { canonStatus, scoreNum, scoreTone, statusDot } from "@/lib/format";
 import { InboxTriage } from "@/components/inbox/inbox-triage";
+import { ShortlistPanel } from "@/components/pipeline/shortlist-panel";
 import { ScanButton } from "@/components/scan-button";
 import { BroadSearchButton } from "@/components/broad-search-button";
 import { cn } from "@/lib/cn";
 
-// INBOX (the triage queue) is the default tab; the rest filter the tracker.
+// INBOX and SHORTLIST are triage surfaces (raw postings, not tracker rows);
+// the rest filter the tracker. SHORTLIST replaces the old ALL tab, which was
+// just every tracker row with no filter — redundant with the status tabs
+// already sitting next to it.
 const TABS = [
   "INBOX",
-  "ALL",
+  "SHORTLIST",
   "EVALUATED",
   "APPLIED",
   "RESPONDED",
@@ -35,9 +39,11 @@ type SortKey = (typeof SORT_KEYS)[number];
 export function PipelineView({
   applications,
   inbox,
+  shortlist,
 }: {
   applications: Application[];
   inbox: InboxJob[];
+  shortlist: ShortlistItem[];
 }) {
   const params = useSearchParams();
   const router = useRouter();
@@ -93,9 +99,8 @@ export function PipelineView({
   }, [inbox]);
 
   const filtered = useMemo(() => {
-    if (tab === "INBOX") return [];
-    let rows = applications;
-    if (tab !== "ALL") rows = rows.filter((r) => canonStatus(r.status).includes(tab));
+    if (tab === "INBOX" || tab === "SHORTLIST") return [];
+    let rows = applications.filter((r) => canonStatus(r.status).includes(tab));
     if (minFilter != null) {
       rows = rows.filter((r) => {
         const n = scoreNum(r.score);
@@ -133,7 +138,7 @@ export function PipelineView({
         </div>
         {/* the tracker has its own search; the inbox brings its own facet filters */}
         <div className="flex flex-col gap-3 sm:flex-row sm:items-center">
-          {tab !== "INBOX" && (
+          {tab !== "INBOX" && tab !== "SHORTLIST" && (
             <div className="relative w-full sm:w-64">
               <Search className="pointer-events-none absolute left-3 top-1/2 size-4 -translate-y-1/2 text-faint" />
               <input
@@ -157,8 +162,8 @@ export function PipelineView({
           const count =
             t === "INBOX"
               ? pendingInbox.length
-              : t === "ALL"
-                ? applications.length
+              : t === "SHORTLIST"
+                ? shortlist.length
                 : applications.filter((r) => canonStatus(r.status).includes(t)).length;
           return (
             <button
@@ -177,7 +182,7 @@ export function PipelineView({
         })}
       </div>
 
-      {tab !== "INBOX" && minFilter != null && (
+      {tab !== "INBOX" && tab !== "SHORTLIST" && minFilter != null && (
         <div className="mt-3 flex items-center gap-2">
           <span className="text-xs text-faint">Filtered:</span>
           <button
@@ -195,10 +200,12 @@ export function PipelineView({
       {tab === "INBOX" ? (
         /* ── Inbox: the triage surface (Abundance → Triage → Shortlist → Score) ── */
         pendingInbox.length > 0 ? (
-          <InboxTriage inbox={pendingInbox} />
+          <InboxTriage inbox={pendingInbox} shortlist={shortlist} />
         ) : (
           <InboxEmpty count={0} filtered={false} />
         )
+      ) : tab === "SHORTLIST" ? (
+        <ShortlistPanel items={shortlist} />
       ) : filtered.length > 0 ? (
         <>
           {/* ── Mobile: sort control + card list (the table can't earn its width on a phone) ── */}
@@ -329,7 +336,7 @@ export function PipelineView({
         </div>
       )}
 
-      {(tab === "ALL" || tab === "EVALUATED") && evaluatedCount > 0 && (
+      {tab === "EVALUATED" && evaluatedCount > 0 && (
         <button
           type="button"
           onClick={() => setShowClearEvaluated(true)}

@@ -173,7 +173,13 @@ export async function checkUrlLiveness(page, url, { extraSettleMs = 0 } = {}) {
         .filter(Boolean);
     });
 
-    return classifyLiveness({ status, requestedUrl: url, finalUrl, bodyText, applyControls });
+    // bodyText rides along with the verdict: this is the only place in the
+    // system where a posting is open in a real browser, fully hydrated, so it
+    // is the only place the JD text can be had for JS-rendered boards. It used
+    // to be computed here purely to classify liveness and then dropped, which
+    // left scoring to re-fetch the URL with a plain HTTP tool and read a shell.
+    // Consumers that only want the verdict can keep ignoring the extra field.
+    return { ...classifyLiveness({ status, requestedUrl: url, finalUrl, bodyText, applyControls }), bodyText };
   } catch (err) {
     // Transient failures (timeout, DNS, TLS, 5xx) shouldn't be treated as expired —
     // doing so would cause scan --verify to drop the URL and write it to scan-history,

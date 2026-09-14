@@ -157,6 +157,8 @@ const SYSTEM_PATHS = [
   'scan-ats-full.mjs',
   'match-star.mjs',
   'jd-skill-gap.mjs',
+  'jd-capture.mjs',
+  'reconcile-report.mjs',
   'prepare-application.mjs',
   'providers/',
   'seeds/',

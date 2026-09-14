@@ -8,7 +8,29 @@ type ProfileData = {
   candidate?: { full_name?: string; email?: string; location?: string };
   target_roles?: { primary?: string[]; archetypes?: any[] };
   narrative?: { headline?: string; exit_story?: string; superpowers?: string[]; proof_points?: any[] };
-  compensation?: { target_range?: string; currency?: string; location_flexibility?: string };
+  compensation?: {
+    target_range?: string; currency?: string; location_flexibility?: string;
+    cutoff?: number; range_min?: number; range_max?: number; minimum?: string;
+  };
+};
+
+/** Mirrors lib/compensation.ts's parseMoney, for pre-filling from a profile
+ *  that still only has the legacy display strings ("€35,000", "€35k+"). */
+function parseLegacyMoney(raw: unknown): number | null {
+  if (typeof raw === "number" && Number.isFinite(raw)) return raw > 0 ? raw : null;
+  if (typeof raw !== "string") return null;
+  const m = raw.replace(/,/g, "").match(/(\d+(?:\.\d+)?)\s*([kK])?/);
+  if (!m) return null;
+  let n = Number(m[1]);
+  if (!Number.isFinite(n) || n <= 0) return null;
+  if (m[2]) n *= 1000;
+  if (n < 1000) n *= 1000;
+  return n;
+}
+
+const num = (v: string): number | null => {
+  const n = Number(v.trim());
+  return v.trim() !== "" && Number.isFinite(n) && n > 0 ? n : null;
 };
 
 export function ProfileEditor() {
@@ -21,7 +43,11 @@ export function ProfileEditor() {
   const [email, setEmail] = useState("");
   const [location, setLocation] = useState("");
   const [roles, setRoles] = useState("");
-  const [targetRange, setTargetRange] = useState("");
+  // Canonical salary numbers. Strings in state (an empty input must stay empty,
+  // not become 0 and silently write a zero floor); coerced on save.
+  const [cutoff, setCutoff] = useState("");
+  const [rangeMin, setRangeMin] = useState("");
+  const [rangeMax, setRangeMax] = useState("");
   const [currency, setCurrency] = useState("GBP");
   const [remote, setRemote] = useState("");
 
@@ -57,11 +83,37 @@ export function ProfileEditor() {
         if (data.compensation) {
           setCurrency(data.compensation.currency || "GBP");
           setRemote(data.compensation.location_flexibility || "");
-          setTargetRange(data.compensation.target_range || "");
+          // Prefer the canonical numbers; fall back to parsing the legacy
+          // display strings so an un-migrated profile still populates.
+          const c = data.compensation;
+          setCutoff(String(c.cutoff ?? parseLegacyMoney(c.minimum) ?? ""));
+          setRangeMin(String(c.range_min ?? parseLegacyMoney(c.target_range) ?? ""));
+          setRangeMax(String(c.range_max ?? ""));
         }
       })
       .finally(() => setLoading(false));
   }, []);
+
+  // What the save will actually generate, shown before it happens. Mirrors
+  // lib/compensation.ts's formatting — this is a preview, the server derives
+  // the real values.
+  const sym = currency === "GBP" ? "£" : currency === "USD" ? "$" : "€";
+  const short = (n: number) => {
+    const k = n / 1000;
+    return `${sym}${Number.isInteger(k) ? k : k.toFixed(1).replace(/\.0$/, "")}k`;
+  };
+  const cutN = num(cutoff), minN = num(rangeMin), maxN = num(rangeMax);
+  const compPreview = cutN
+    ? `cut-off ${sym}${cutN.toLocaleString("en-US")}${
+        minN || maxN ? ` · range ${minN && maxN && maxN > minN ? `${short(minN)}–${short(maxN)}` : `${short((minN ?? maxN)!)}+`}` : ""
+      }`
+    : null;
+  const cutoffWarning =
+    minN && cutN && minN < cutN
+      ? "Range min is below the cut-off — postings inside the bottom of your range would be filtered out before you see them."
+      : maxN && minN && maxN < minN
+        ? "Range max is below range min."
+        : null;
 
   async function save() {
     setSaving(true);
@@ -73,7 +125,9 @@ export function ProfileEditor() {
     const patch = {
       name, email, location,
       roles: rolesArray,
-      target_range: targetRange,
+      cutoff: num(cutoff),
+      range_min: num(rangeMin),
+      range_max: num(rangeMax),
       currency, remote,
       headline,
       exit_story: exitStory,
@@ -127,17 +181,51 @@ export function ProfileEditor() {
         </div>
       </div>
 
-      <div className="grid gap-4 sm:grid-cols-[1fr_120px]">
-        <div className="space-y-1.5">
-          <label className="text-xs font-semibold uppercase tracking-wider text-muted flex items-center gap-1.5"><PoundSterling className="size-3" /> Salary Target Range</label>
-          <input value={targetRange} onChange={e => setTargetRange(e.target.value)} className="w-full rounded-xl border border-border bg-surface/60 px-4 py-2.5 text-sm outline-none transition-colors focus:border-brand/50" placeholder="£40K-80K" />
+      <div className="space-y-3">
+        <div className="grid gap-4 sm:grid-cols-[1fr_1fr_1fr_110px]">
+          <div className="space-y-1.5">
+            <label className="text-xs font-semibold uppercase tracking-wider text-muted flex items-center gap-1.5"><PoundSterling className="size-3" /> Cut-off</label>
+            <input
+              type="number" inputMode="numeric" min={0} step={1000}
+              value={cutoff} onChange={e => setCutoff(e.target.value)}
+              className="w-full rounded-xl border border-border bg-surface/60 px-4 py-2.5 text-sm tabular-nums outline-none transition-colors focus:border-brand/50"
+              placeholder="35000"
+            />
+          </div>
+          <div className="space-y-1.5">
+            <label className="text-xs font-semibold uppercase tracking-wider text-muted">Range min</label>
+            <input
+              type="number" inputMode="numeric" min={0} step={1000}
+              value={rangeMin} onChange={e => setRangeMin(e.target.value)}
+              className="w-full rounded-xl border border-border bg-surface/60 px-4 py-2.5 text-sm tabular-nums outline-none transition-colors focus:border-brand/50"
+              placeholder="35000"
+            />
+          </div>
+          <div className="space-y-1.5">
+            <label className="text-xs font-semibold uppercase tracking-wider text-muted">Range max</label>
+            <input
+              type="number" inputMode="numeric" min={0} step={1000}
+              value={rangeMax} onChange={e => setRangeMax(e.target.value)}
+              className="w-full rounded-xl border border-border bg-surface/60 px-4 py-2.5 text-sm tabular-nums outline-none transition-colors focus:border-brand/50"
+              placeholder="optional"
+            />
+          </div>
+          <div className="space-y-1.5">
+            <label className="text-xs font-semibold uppercase tracking-wider text-muted">Currency</label>
+            <select value={currency} onChange={e => setCurrency(e.target.value)} className="w-full rounded-xl border border-border bg-surface/60 px-4 py-2.5 text-sm outline-none transition-colors focus:border-brand/50 appearance-none">
+              <option value="GBP">GBP (£)</option><option value="USD">USD ($)</option><option value="EUR">EUR (€)</option>
+            </select>
+          </div>
         </div>
-        <div className="space-y-1.5">
-          <label className="text-xs font-semibold uppercase tracking-wider text-muted">Currency</label>
-          <select value={currency} onChange={e => setCurrency(e.target.value)} className="w-full rounded-xl border border-border bg-surface/60 px-4 py-2.5 text-sm outline-none transition-colors focus:border-brand/50 appearance-none">
-            <option value="GBP">GBP (£)</option><option value="USD">USD ($)</option><option value="EUR">EUR (€)</option>
-          </select>
-        </div>
+        {/* The whole point of the rewrite: say out loud which number actually
+            gates anything, and show the label that will be generated, so a save
+            can't silently move a display string and leave the gates behind. */}
+        <p className="text-xs leading-relaxed text-muted">
+          <span className="font-medium text-foreground">Cut-off</span> is the only figure that filters anything — it sets the
+          scanner&apos;s salary floor and the hard reject in triage and scoring. The range is for your CV and reports.
+          {compPreview && <> Saves as <span className="font-medium text-foreground tabular-nums">{compPreview}</span>.</>}
+          {cutoffWarning && <span className="mt-1 block text-amber-600 dark:text-amber-500">{cutoffWarning}</span>}
+        </p>
       </div>
 
       <button onClick={() => setAdvanced(!advanced)} className="flex items-center gap-2 text-sm font-medium text-muted hover:text-foreground transition-colors py-2">

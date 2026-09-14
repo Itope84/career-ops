@@ -1,9 +1,12 @@
-import { spawn } from "node:child_process";
+import { spawn, execFileSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { resolveCli, defaultCliId } from "@/lib/clis";
-import { careerOpsRoot, readMemory, readOpencodeModels } from "@/lib/career-ops";
-import { acquireTrackerWrite, releaseTrackerWrite } from "@/lib/core/run-registry";
+import { careerOpsRoot, readMemory, readOpencodeModels, jdCachePathFor, rootScript } from "@/lib/career-ops";
+import { acquireTrackerWrite, releaseTrackerWrite, registerJob, updateJob } from "@/lib/core/run-registry";
+import { acquireSlot, releaseSlot } from "@/lib/core/job-queue";
+import { findOpencodeSessionId } from "@/lib/core/opencode-transcript";
+import { randomUUID } from "node:crypto";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -15,6 +18,102 @@ export const maxDuration = 800; // a real oferta evaluation / pdf-mode CV tailor
 // (reserve-report-num.mjs → reports/ → batch/tracker-additions/ → merge-tracker.mjs),
 // so a web evaluation is byte-identical to a CLI one (single source of truth, no
 // drift). kind "research" stays read-only. Streams progress as NDJSON events.
+/**
+ * How the evaluator should obtain the job description.
+ *
+ * When scan cached a rendered copy, point at the FILE. That is not just a
+ * speed-up — it is a correctness fix. The worker is headless with no browser,
+ * so its only alternative is a plain HTTP fetch, and on a JS-rendered board
+ * that returns a shell plus whatever made it into the page's JSON-LD. A real
+ * case: a Workday posting listing United Kingdom / Ireland / Spain carries
+ * ONLY the UK location in its structured data, so the evaluator read
+ * "UK, remote-first", correctly applied the candidate's no-remote and
+ * UK-sponsorship rules, and scored it 2.0/5 — for a role openly open to
+ * Ireland. The cached copy is the fully hydrated page, so those locations are
+ * all present. Falls back to the old WebFetch wording when nothing is cached.
+ */
+/**
+ * Take a role OUT of the shortlist the moment its evaluation genuinely
+ * finishes — server-side, unconditionally, the instant `findOwnReport()`
+ * confirms a report carrying THIS job's own URL exists. Deliberately NOT
+ * left to the browser.
+ *
+ * Before this, removal only happened via a client event (`co-job-done`) fired
+ * from an open tab that happened to be watching when the job transitioned.
+ * Adoption only looks back 10 minutes and the client's in-memory job list is
+ * bounded, so anything that finished while no tab was open, or finished more
+ * than ~10 minutes before a tab reconnected, just stayed in the shortlist
+ * forever with no further signal that it had in fact been scored — 8 roles
+ * did exactly this in one night. This runs from the same process that just
+ * confirmed the report was written, so there is no window for it to miss.
+ *
+ * The identity check in `findOwnReport()` is what makes it safe to call this
+ * unconditionally: an earlier version proved a report existed with a bare
+ * directory-wide file count, which any concurrently-running sibling job
+ * could satisfy just by reserving a report NUMBER (an empty placeholder file)
+ * — three roles fired together via "Score selected" were all marked done and
+ * deleted from the shortlist that way, only one of them having done any real
+ * work. Removal now only ever fires for the job whose own posting URL is
+ * actually in the new report's header.
+ *
+ * Best-effort and silent on failure: a shortlist that's briefly one entry
+ * behind is a UI nuisance; throwing here would take down an otherwise
+ * successful, already-persisted evaluation over a bookkeeping step.
+ */
+/**
+ * Finish the persistence the worker started but may not have completed.
+ *
+ * modes/oferta.md's sequence is: reserve a number → write the report → stage a
+ * tracker TSV → merge it → clean the inbox. A worker dying between "write the
+ * report" and "merge it" is the single most common failure here — `opencode
+ * run` stalls mid-step routinely — and it produces the worst possible state: a
+ * complete, correct report that is invisible everywhere, because the job gets
+ * marked done and dropped from the shortlist on the strength of the report
+ * alone. Eleven reports were recovered by hand this way in one sitting.
+ *
+ * reconcile-report.mjs closes that gap deterministically: already tracked →
+ * no-op, TSV already staged → merge it, neither → synthesize the row from the
+ * report's own Machine Summary and merge. It never invents a field, and it is
+ * idempotent, so calling it on every finished evaluation is safe.
+ *
+ * Returns false when the report could NOT be got into the tracker — the caller
+ * then surfaces the run as incomplete and LEAVES IT IN THE SHORTLIST, rather
+ * than quietly dropping a role that shows up nowhere.
+ */
+function reconcileReportIntoTracker(reportFile: string, root: string): boolean {
+  try {
+    const out = execFileSync(process.execPath, [rootScript("reconcile-report"), "--report", reportFile], {
+      cwd: root,
+      encoding: "utf8",
+      timeout: 90_000,
+      maxBuffer: 4 * 1024 * 1024,
+    });
+    return JSON.parse(out.trim()).ok === true;
+  } catch {
+    return false; // non-zero exit, timeout, or unparseable output — treat as not tracked
+  }
+}
+
+function removeFromShortlistOnScore(url: string, root: string): void {
+  try {
+    execFileSync(process.execPath, [rootScript("shortlist-entries")], {
+      cwd: root,
+      input: JSON.stringify({ op: "remove", url }),
+      maxBuffer: 1024 * 1024,
+      encoding: "utf8",
+    });
+  } catch {
+    /* not in the shortlist, or pipeline.md briefly locked by something else — fine either way */
+  }
+}
+
+function jdClause(url: string): string {
+  const cached = jdCachePathFor(url);
+  return cached
+    ? `Read the job description from \`${cached}\` — it is the FULL rendered page text, captured from a real browser at scan time, and is more complete than anything you can fetch headlessly (JS-rendered boards hide locations and requirements from plain HTTP fetches). Treat it as the posting. Mark the report header "Verification: cached render (scan time)". Only use WebFetch if that file is missing or obviously truncated.`
+    : `Use WebFetch to read the posting (you are headless — Playwright is unavailable, so use WebFetch and mark the report header "Verification: unconfirmed (batch mode)").`;
+}
+
 function buildPrompt(kind: string, input: string, memory: string, today: string, cwd: string): string {
   const mem = memory.trim() ? `\n\nDurable notes about the user (from their profile):\n${memory.trim()}\n` : "";
   if (kind === "research") {
@@ -69,7 +168,7 @@ VERDICT: {5 if at least one new role was added, else 2}/5 — {N} new role(s) ad
   // evaluate (default) — run the REAL oferta mode + persist canonically
   return `You are running the OFFICIAL career-ops job evaluation, HEADLESS, on the user's own machine. Your absolute Current Working Directory (CWD) is EXACTLY \`${cwd}\`. You MUST use this exact path for all tool calls and commands. Today is ${today}. Run the REAL career-ops evaluation — do NOT improvise your own scoring.
 
-1. Read modes/oferta.md and follow it EXACTLY (blocks A–F, G posting-legitimacy, and the Machine Summary). Ground the fit in THIS person: read cv.md, config/profile.yml and modes/_profile.md. Use WebFetch to read the posting (you are headless — Playwright is unavailable, so use WebFetch and mark the report header "Verification: unconfirmed (batch mode)").
+1. Read modes/oferta.md and follow it EXACTLY (blocks A–F, G posting-legitimacy, and the Machine Summary). Ground the fit in THIS person: read cv.md, config/profile.yml and modes/_profile.md. ${jdClause(input)}
 
 2. Persist the result CANONICALLY so the web and the CLI share ONE source of truth:
    a. Reserve a report number: run \`node reserve-report-num.mjs\` — its stdout is a 3-digit number (e.g. 035).
@@ -88,13 +187,17 @@ Posting URL: ${input}`;
 }
 
 export async function POST(req: Request) {
-  let body: { kind?: string; input?: string; cliId?: string };
+  let body: { kind?: string; input?: string; cliId?: string; id?: string; title?: string; subtitle?: string };
   try {
     body = await req.json();
   } catch {
     return new Response(JSON.stringify({ error: "bad json" }), { status: 400 });
   }
-  const { kind = "evaluate", input, cliId: requestedCliId } = body;
+  const { kind = "evaluate", input, cliId: requestedCliId, title, subtitle } = body;
+  // The client generates this so it can reconcile its own local job against
+  // the durable registry later (reload, dropped connection, another device).
+  // Falls back to a server-generated id for any caller that doesn't send one.
+  const jobId = typeof body.id === "string" && body.id.trim() ? body.id.trim() : randomUUID();
   if (!input) {
     return new Response(JSON.stringify({ error: "input required" }), { status: 400 });
   }
@@ -173,18 +276,57 @@ export async function POST(req: Request) {
     if (model) args.splice(2, 0, "-m", model);
   }
 
-  // For write-needing kinds, snapshot reports/ so we can verify the worker
-  // actually persisted (non-Claude CLIs lack Write auth and silently no-op).
+  // For write-needing kinds, snapshot reports/ so we can verify THIS job's
+  // own worker actually persisted its own report (non-Claude CLIs lack Write
+  // auth and silently no-op).
+  //
+  // NOT a file count. A bare count — `readdirSync().length` before vs. after —
+  // has no idea WHICH job caused the directory to grow, and under real
+  // concurrency (several evaluations from "Score selected" running in
+  // parallel through the job queue) any one of them reserving a report
+  // number is enough to flip every OTHER concurrently-running job's own
+  // count comparison to "wrote a report" too — including jobs that had
+  // barely started. Confirmed live: three roles fired together all got
+  // marked done and deleted from the shortlist within the same ~40s window,
+  // while one of them (checked against its own opencode transcript) had done
+  // nothing but read a few files and one webfetch — no report, no VERDICT,
+  // nowhere near finished. `reserve-report-num.mjs` creates its placeholder
+  // (`NNN-RESERVED.md`, zero bytes) the instant a number is claimed, long
+  // before any real content exists, which is exactly what tripped the count.
+  //
+  // The fix: snapshot the actual FILE SET before spawning, and afterward
+  // require a NEW, non-placeholder file whose own `**URL:**` header matches
+  // THIS job's `input` — every report is required to carry that header (see
+  // AGENTS.md), so it is the one piece of identity a report already commits
+  // to. A sibling job's report existing is no longer evidence of anything.
   const reportsDir = path.join(careerOpsRoot(), "reports");
-  const countReports = () => {
+  const listReportFiles = (): Set<string> => {
     try {
-      return fs.readdirSync(reportsDir).filter((f) => f.endsWith(".md")).length;
+      // RESERVED placeholders are real files but never real reports.
+      return new Set(fs.readdirSync(reportsDir).filter((f) => f.endsWith(".md") && !f.endsWith("-RESERVED.md")));
     } catch {
-      return 0;
+      return new Set();
     }
   };
   const persists = kind === "evaluate";
-  const reportsBefore = persists ? countReports() : 0;
+  const reportsBefore = persists ? listReportFiles() : new Set<string>();
+  /** The exact new report this job's own run produced, or null. Checked once,
+   *  after the child closes — see its call site for why a null here means
+   *  "surface as an error", never "treat as done anyway". */
+  const findOwnReport = (): string | null => {
+    if (!persists) return null;
+    for (const f of listReportFiles()) {
+      if (reportsBefore.has(f)) continue; // pre-existing — not from this run
+      try {
+        const content = fs.readFileSync(path.join(reportsDir, f), "utf8");
+        const m = content.match(/\*\*URL:\*\*\s*(\S+)/);
+        if (m && m[1].trim() === input.trim()) return f;
+      } catch {
+        /* unreadable (mid-write?) — not proof of anything, keep looking */
+      }
+    }
+    return null;
+  };
   // Tracker-mutating runs hold a write token so a row delete can't race their merge
   // (tracker.mjs delete doesn't yet share a lock with merge-tracker — see run-registry).
   const writeToken = kind === "evaluate" || kind === "pdf" ? acquireTrackerWrite() : null;
@@ -196,31 +338,189 @@ export async function POST(req: Request) {
   // session — confirmed via opencode's own log (~/.local/share/opencode/log),
   // which shows the process never getting past "init". Other CLIs don't need
   // piped stdin either (they take the prompt via -p / positional arg).
-  const child = spawn(binPath, args, { cwd: careerOpsRoot(), env: process.env, stdio: ["ignore", "pipe", "pipe"] });
+  // NOT spawned yet — the process is the expensive, machine-killing resource,
+  // so it is created only once job-queue.ts hands out a slot (see below).
+  let child: ReturnType<typeof spawn> | null = null;
   const enc = new TextEncoder();
+
+  // Durable record from the moment the request is ACCEPTED — independent of
+  // whether this HTTP connection stays open, and now also independent of
+  // whether a worker slot is free yet. See run-registry.ts's header.
+  registerJob({
+    id: jobId,
+    kind: kind as "evaluate" | "pdf" | "research" | "fix-portal" | "scan-broad",
+    title: title || `${kind} · ${input}`,
+    subtitle,
+    input,
+    status: "queued",
+  });
 
   // `closed` + kill timer in the OUTER scope so cancel() (client disconnect) can
   // flip `closed` before the child's late handlers run, and send() is try/catch'd —
   // otherwise a late enqueue onto a closed controller throws uncaught (see #1155).
   let closed = false;
   let killer: ReturnType<typeof setTimeout> | undefined;
+  let reaper: ReturnType<typeof setTimeout> | undefined;
   let heartbeat: ReturnType<typeof setInterval> | undefined;
   const stream = new ReadableStream<Uint8Array>({
-    start(controller) {
+    async start(controller) {
       let buf = "";
       let emittedText = false; // any assistant text delta → the CLI actually ran
       let sawError = false;
       let lastTokens = 0; // per-run token cost from the Claude result event (#6) — local only
       let lastCostUsd: number | null = null;
+      // Bounded tail of everything the CLI has printed — kept ONLY so a
+      // VERDICT line can be recovered for the registry even when nobody's
+      // connection is open to read the live stream. Same idea as the
+      // client's own 8000-char rolling tail, just server-side.
+      let textTail = "";
+      let killedByTimeout = false;
+      // Distinct from `closed` (which only means "stop writing to the SSE
+      // stream", and gets set on a client disconnect via cancel() — long
+      // before the child itself has actually exited). This one guards the
+      // registry write specifically, so a disconnect can never suppress it.
+      let finished = false;
       // pdf-mode tailors a full CV + renders it, scan-broad walks multiple
       // WebSearch queries + liveness checks — both need more headroom.
       const killMs = kind === "pdf" || kind === "scan-broad" ? 720_000 : 285_000;
-      killer = setTimeout(() => {
-        try { child.kill("SIGTERM"); } catch { /* ignore */ }
-      }, killMs);
       const send = (obj: unknown) => {
         if (closed) return;
         try { controller.enqueue(enc.encode(JSON.stringify(obj) + "\n")); } catch { closed = true; }
+      };
+
+      // ── Concurrency gate ────────────────────────────────────────────────
+      // Wait here, NOT in the browser. "Score all" fires one request per role;
+      // without this, 99 roles meant 99 concurrent agent processes, which
+      // exhausted RAM and took every career-ops instance on this machine down
+      // with it. Waiting costs one idle socket; the job is already durable in
+      // the registry, and this handler keeps running after the client goes
+      // away, so a queued job still starts even if the tab was closed.
+      let slotHeld = false;
+      send({ type: "status", label: "Queued — waiting for a worker slot" });
+      await acquireSlot();
+      slotHeld = true;
+      try {
+        child = spawn(binPath, args, { cwd: careerOpsRoot(), env: process.env, stdio: ["ignore", "pipe", "pipe"] });
+      } catch (e) {
+        // A slot acquired and then never released permanently shrinks the pool;
+        // enough of those and every future job waits forever on a queue nothing
+        // will ever drain. spawn() throwing is rare (bad binary path, EMFILE)
+        // but it is precisely the path that would leak, so it is handled before
+        // teardown() exists to handle it.
+        slotHeld = false;
+        releaseSlot();
+        const msg = e instanceof Error ? e.message : "Could not start the CLI process";
+        updateJob(jobId, { status: "error", endedAt: Date.now(), error: msg });
+        send({ type: "error", msg });
+        if (writeToken !== null) releaseTrackerWrite(writeToken);
+        try { controller.close(); } catch { /* */ }
+        closed = true;
+        return;
+      }
+      const proc = child; // narrowed, non-null alias for the handlers below
+
+      // Best-effort, opencode-only: capture the session id opencode assigns
+      // itself, so a failure can later be replayed from its own transcript
+      // instead of reasoning about a rolling stdout tail that's gone the
+      // moment this request ends. Never awaited — must not delay anything.
+      if (cliId === "opencode") {
+        const spawnedAt = Date.now();
+        void findOpencodeSessionId(spawnedAt).then((sid) => {
+          if (sid) updateJob(jobId, { opencodeSessionId: sid });
+        });
+      }
+      // startedAt is reset so elapsed time means "time actually working",
+      // not "time since you clicked", which would make queued jobs look slow.
+      updateJob(jobId, { status: "running", startedAt: Date.now() });
+      send({ type: "status", label: "Started" });
+
+      // ── Teardown: the one place the child dies and the slot comes back ───
+      // `opencode run` boots a file watcher and an event stream and routinely
+      // NEVER EXITS after it has finished answering, so waiting on "close"
+      // leaks the process forever. That is what left 92 orphaned agents on
+      // this machine in one evening. Every terminal path calls this exactly
+      // once: normal completion, error, timeout, and the VERDICT reap below.
+      // Deliberately NOT called from cancel() — a client disconnect must let
+      // the run finish and write its report.
+      let tornDown = false;
+      const teardown = () => {
+        if (tornDown) return;
+        tornDown = true;
+        if (killer) clearTimeout(killer);
+        if (reaper) clearTimeout(reaper);
+        try { child?.kill("SIGTERM"); } catch { /* already gone */ }
+        // SIGTERM is a request; opencode does not always honour it. Follow up
+        // with SIGKILL so a wedged child can never outlive its job.
+        const c = child;
+        setTimeout(() => { try { c?.kill("SIGKILL"); } catch { /* already gone */ } }, 5_000).unref?.();
+        if (slotHeld) {
+          slotHeld = false;
+          releaseSlot();
+        }
+      };
+
+      killer = setTimeout(() => {
+        killedByTimeout = true;
+        try { child?.kill("SIGTERM"); } catch { /* ignore */ }
+      }, killMs);
+
+      // ── VERDICT reap ────────────────────────────────────────────────────
+      // Every prompt above ends "output EXACTLY one final line: VERDICT: …",
+      // and each one is explicit that all writing and merging happens BEFORE
+      // that line. So a VERDICT on stdout means the work is done — regardless
+      // of whether the process ever intends to exit, which `opencode run`
+      // frequently does not.
+      //
+      // Waiting for "close" is what leaked a process per evaluation all night.
+      // The short grace period lets a final flush land before SIGTERM, rather
+      // than racing the child's own last writes.
+      const REAP_GRACE_MS = 2_000;
+      const maybeReap = () => {
+        if (finished || reaper) return;
+        if (!/VERDICT:\s*[\d.]+\s*\/\s*5/i.test(textTail)) return;
+        send({ type: "status", label: "Verdict received — wrapping up" });
+        reaper = setTimeout(() => {
+          // finishDone() calls teardown(), which kills the child and returns
+          // the concurrency slot. Without this the slot would be held by a
+          // process that finished minutes ago and the pool would drain to zero.
+          finishDone();
+          close();
+        }, REAP_GRACE_MS);
+      };
+      // Every terminal outcome goes through these two so the durable registry
+      // (survives a dead connection) and the live SSE event (nice for an open
+      // tab) can never drift apart — one call site instead of six.
+      const finishDone = () => {
+        if (finished) return;
+        finished = true;
+        const vm = textTail.match(/VERDICT:\s*([\d.]+)\s*\/\s*5\s*[—:|-]+\s*(.+)/i);
+        let score: number | null = null;
+        let reason: string | undefined;
+        if (vm) {
+          score = parseFloat(vm[1]);
+          reason = vm[2].trim().slice(0, 200);
+        } else {
+          const s = textTail.match(/\b([0-5](?:\.\d)?)\s*\/\s*5\b/);
+          if (s) score = parseFloat(s[1]);
+        }
+        send({ type: "done", tokens: lastTokens, costUsd: lastCostUsd });
+        updateJob(jobId, {
+          status: "done",
+          endedAt: Date.now(),
+          result: { score, reason, tokens: lastTokens, costUsd: lastCostUsd ?? undefined },
+        });
+        teardown();
+      };
+      const finishError = (msg: string) => {
+        if (finished) return;
+        finished = true;
+        send({ type: "error", msg });
+        updateJob(jobId, {
+          status: killedByTimeout ? "timeout" : "error",
+          endedAt: Date.now(),
+          error: killedByTimeout ? `Timed out after ${Math.round(killMs / 1000)}s — the CLI didn't finish in time.` : msg,
+        });
+        teardown();
       };
       // A real evaluation goes quiet for 60-90s+ at a time (WebSearch round-trips,
       // model "thinking" between tool calls print nothing) — long enough for a
@@ -241,11 +541,14 @@ export async function POST(req: Request) {
         }
       };
 
-      child.stdout.on("data", (d: Buffer) => {
+      proc.stdout!.on("data", (d: Buffer) => {
         if (closed) return;
         if (!isClaude) {
           emittedText = true;
-          send({ type: "text", text: d.toString() });
+          const t = d.toString();
+          textTail = (textTail + t).slice(-4000);
+          send({ type: "text", text: t });
+          maybeReap();
           return;
         }
         buf += d.toString();
@@ -262,6 +565,7 @@ export async function POST(req: Request) {
                 send({ type: "tool", name: e.content_block.name });
               } else if (e?.type === "content_block_delta" && e.delta?.text) {
                 emittedText = true;
+                textTail = (textTail + e.delta.text).slice(-4000);
                 send({ type: "text", text: e.delta.text });
               }
             } else if (ev.type === "system" && ev.subtype === "init") {
@@ -279,7 +583,7 @@ export async function POST(req: Request) {
           }
         }
       });
-      child.stderr.on("data", (d: Buffer) => {
+      proc.stderr!.on("data", (d: Buffer) => {
         const s = d.toString();
         // Widened: auth/login/quota failures are the most common real error and
         // the old narrow regex missed them (silent false "success").
@@ -293,38 +597,99 @@ export async function POST(req: Request) {
           // (unlike Antigravity, which writes progress to stdout and was always
           // forwarded below).
           emittedText = true;
+          textTail = (textTail + s).slice(-4000);
           send({ type: "text", text: s });
         }
       });
-      child.on("error", (e) => { send({ type: "error", msg: e.message }); close(); });
-      child.on("close", (code) => {
-        const wroteReport = countReports() > reportsBefore;
+      proc.on("error", (e) => { finishError(e.message); close(); });
+      proc.on("close", (code) => {
+        // child.on("error") may already have run finishError() for this same
+        // terminal outcome — Node still fires "close" afterward. finishDone/
+        // finishError are themselves idempotent (guarded by `finished`), so
+        // this would be a no-op rather than a double registry write; still
+        // skip the (otherwise pointless) branch evaluation below when so.
+        if (finished) return;
+        const ownReportFile = findOwnReport();
+        const wroteReport = ownReportFile != null;
         const cleanExit = code === 0; // non-zero OR null (killed/signal) = NOT clean
+        // A VERDICT line is the completion signal EVERY prompt in buildPrompt()
+        // is instructed to emit as its LAST line, only after all real work
+        // (writing, merging) is already done. Proven case: a scan-broad run
+        // whose own opencode transcript (message.finish === "stop", correctly
+        // written pipeline.md + scan-history.tsv rows) shows a completely
+        // successful turn ending in "VERDICT: 5/5 — 2 new role(s) added to
+        // your inbox" — yet the child process then closed with a non-zero/
+        // killed exit code, and the OLD cleanExit-only check below banked that
+        // as a failure. opencode routinely does not exit(0) even after
+        // finishing correctly (it can hang on its own file watcher/event
+        // stream, or get reaped once its output is fully read) — requiring a
+        // clean exit for non-persisting kinds (research/fix-portal/scan-broad)
+        // misclassified a near-guaranteed fraction of genuinely successful
+        // runs on this CLI.
+        //
+        // Deliberately NOT gated on `!sawError` — caught live, by the very
+        // transcript tool this fix's own commit added: a SECOND real
+        // scan-broad success ("VERDICT: 2/5 — 0 new role(s) added to your
+        // inbox", model's own reasoning confirming it correctly checked every
+        // candidate and found nothing new) still got banked as an error,
+        // because `sawError` had fired on ordinary tool noise somewhere in
+        // 90+ seconds of bash/WebSearch output — the exact false-positive
+        // failure mode already called out two branches below for the
+        // evaluate path ("a blunt stderr keyword match... false-positives on
+        // ordinary, expected tool noise"). A VERDICT line only ever appears
+        // after all real work is done, so nothing that happened earlier in
+        // the run should be able to override it after the fact.
+        //
+        // The "/5" is optional: the FIRST live test caught qwen3.7-plus
+        // writing "VERDICT: 5 — ..." with no "/5" at all, which the original,
+        // stricter pattern missed.
+        const verdictSeen = /VERDICT:\s*[\d.]+(?:\s*\/\s*5)?\b/i.test(textTail);
         // Honesty gate (#9): a green "done" with a parsed score requires a CLEAN exit,
         // real output, AND (for evaluations) a report actually written. Anything else
         // is surfaced — an errored run must never be banked as a confident score.
         if (!emittedText && !sawError && !cleanExit) {
-          send({ type: "error", msg: "The CLI exited with an error — is it installed and authenticated?" });
+          finishError("The CLI exited with an error — is it installed and authenticated?");
         } else if (!emittedText && !sawError) {
-          send({ type: "error", msg: "The CLI produced no output — is it installed and authenticated? (career-ops is best on Claude Code.)" });
+          finishError("The CLI produced no output — is it installed and authenticated? (career-ops is best on Claude Code.)");
         } else if (persists && !wroteReport) {
           // The worker ran but never wrote the report/tracker row (e.g. a CLI
           // without file-write authorization) — surface it instead of a fake score.
-          send({ type: "error", msg: "This evaluation didn't save a report, so it's not in your tracker. Full evaluation is verified on Claude Code." });
+          finishError("This evaluation didn't save a report, so it's not in your tracker. Full evaluation is verified on Claude Code.");
         } else if (persists && wroteReport) {
-          // A written report is the strongest possible evidence the real
-          // modes/oferta.md pipeline actually completed — `sawError` is only a
-          // blunt stderr keyword match (e.g. "not found") and false-positives on
-          // ordinary, expected tool noise (a Read on an optional file like
-          // article-digest.md that doesn't exist). Don't let that flip a
-          // genuinely finished, persisted evaluation to "failed, re-run it".
-          send({ type: "done", tokens: lastTokens, costUsd: lastCostUsd });
+          // A report carrying THIS job's own URL in its header (see
+          // findOwnReport) is the strongest possible evidence the real
+          // modes/oferta.md pipeline actually completed FOR THIS POSTING —
+          // `sawError` is only a blunt stderr keyword match (e.g. "not found")
+          // and false-positives on ordinary, expected tool noise (a Read on
+          // an optional file like article-digest.md that doesn't exist).
+          // Don't let that flip a genuinely finished, persisted evaluation to
+          // "failed, re-run it". `persists` is exactly `kind === "evaluate"`
+          // — the only kind the shortlist has any opinion about.
+          //
+          // But a written report is necessary, NOT sufficient: it only proves
+          // step 2 of oferta.md's five. Finish steps 3-4 here (idempotently,
+          // via reconcile-report.mjs) and require the role to actually BE in
+          // the tracker before calling this done and dropping it from the
+          // shortlist. Otherwise a run that died right after writing its
+          // report leaves a role in neither the shortlist nor Evaluated —
+          // exactly how eleven of them went missing in one sitting.
+          const tracked = reconcileReportIntoTracker(ownReportFile!, careerOpsRoot());
+          if (tracked) {
+            removeFromShortlistOnScore(input, careerOpsRoot());
+            finishDone();
+          } else {
+            finishError(
+              "The evaluation wrote its report, but it couldn't be merged into your tracker — so it isn't in Evaluated yet and the role stays in your shortlist. Re-run it, or run `node reconcile-report.mjs --all`.",
+            );
+          }
+        } else if (verdictSeen) {
+          finishDone();
         } else if (!cleanExit || sawError) {
           // Produced output (maybe even a report) but did NOT finish cleanly — flag it
           // instead of recording a confident score off a half-finished run.
-          send({ type: "error", msg: "This run hit an error before finishing, so it isn't recorded as a confident result — re-run it to verify." });
+          finishError("This run hit an error before finishing, so it isn't recorded as a confident result — re-run it to verify.");
         } else {
-          send({ type: "done", tokens: lastTokens, costUsd: lastCostUsd });
+          finishDone();
         }
         close();
       });

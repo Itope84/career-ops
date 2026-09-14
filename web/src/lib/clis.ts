@@ -25,7 +25,18 @@ export const KNOWN: CliSpec[] = [
   { id: "opencode", name: "OpenCode", bin: "opencode", run: "opencode run", url: "https://opencode.ai", args: (p) => ["run", "--auto", p] },
   { id: "copilot", name: "GitHub Copilot CLI", bin: "copilot", run: "copilot -p", url: "https://docs.github.com/en/copilot/github-copilot-in-the-cli", args: (p) => ["-p", p] },
   { id: "qwen", name: "Qwen CLI", bin: "qwen", run: "qwen -p", url: "https://qwen.ai/qwencode", args: (p) => ["-p", p] },
-  { id: "antigravity", name: "Antigravity CLI", bin: "agy", run: "agy -p", url: "https://antigravity.google", args: (p) => ["--model", "Gemini 3.5 Flash (High)", "--dangerously-skip-permissions", "--add-dir", ".", "-p", p] },
+  // Antigravity CLI (`agy`) is REMOVED from this instance on purpose. Upstream
+  // ships it first in the list and first in the default order because of its
+  // free tier, but this fork is configured end-to-end for OpenCode:
+  // config/profile.yml's `opencode_models` routes scan / triage / evaluate to
+  // specific models, and /api/run only applies that routing when the engine is
+  // OpenCode — so any run that landed on agy silently ignored every model
+  // choice. It stayed selected because it was the first preference in two
+  // separate places, so removing it here is what actually stops that.
+  // To restore it, re-add:
+  //   { id: "antigravity", name: "Antigravity CLI", bin: "agy", run: "agy -p",
+  //     url: "https://antigravity.google",
+  //     args: (p) => ["--model", "Gemini 3.5 Flash (High)", "--dangerously-skip-permissions", "--add-dir", ".", "-p", p] },
 ];
 
 function searchDirs(): string[] {
@@ -102,10 +113,18 @@ export function resolveCli(id: string): { spec: CliSpec; binPath: string } | nul
   return { spec, binPath };
 }
 
-// Default engine when the user hasn't picked one in Config: Antigravity first
-// (free tier), then Claude Code, then whatever else is installed. An explicit
-// Config selection always wins — this only fills the gap.
-const DEFAULT_ORDER = ["antigravity", "claude"];
+// Default engine when the user hasn't picked one in Config, in preference
+// order. An explicit Config selection always wins — this only fills the gap.
+//
+// OpenCode first, ahead of upstream's Antigravity-first (free-tier) ordering.
+// The Config choice is stored in the BROWSER (localStorage), so it is absent
+// on every new browser, private window, cleared cache, and remote/tunnel
+// session — and each of those silently fell back to Antigravity, which reads
+// as the setting "resetting itself". This ordering is also what matches the
+// rest of the setup: `opencode_models` in config/profile.yml routes scan /
+// triage / evaluate to specific OpenCode models, which only takes effect when
+// the engine is actually OpenCode.
+const DEFAULT_ORDER = ["opencode", "claude"];
 
 export function defaultCliId(): string | null {
   const dirs = searchDirs();

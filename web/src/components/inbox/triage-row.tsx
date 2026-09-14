@@ -37,6 +37,11 @@ export function TriageRow({
   onSkip,
   onScore,
   onDelete,
+  triageReason,
+  triageChecked,
+  onToggleTriage,
+  labels,
+  selectDisabled,
 }: {
   job: InboxJob;
   source: AtsSource | null;
@@ -49,9 +54,28 @@ export function TriageRow({
   onSkip: () => void;
   onScore: () => void;
   onDelete: () => void;
+  /** Set when Quick Triage recommended discarding this posting — its reason,
+   *  shown inline. Presence alone switches the row into "review a discard"
+   *  mode: the checkbox means "will be archived" instead of "save to
+   *  shortlist" until the batch is committed or dismissed. */
+  triageReason?: string;
+  triageChecked?: boolean;
+  onToggleTriage?: () => void;
+  /** The same three controls mean different things per surface — in the inbox
+   *  the bookmark saves and ✗ hides; on the Shortlist tab the bookmark
+   *  un-saves (back to the inbox) and ✗ deletes. Only the wording changes
+   *  here; what the buttons DO is the caller's handlers. */
+  labels?: { save?: string; saveTitle?: string; skipTitle?: string };
+  /** Multi-select checkbox is non-interactive — used by the Shortlist tab
+   *  while THIS row is already scoring, so it can't be added to a second,
+   *  overlapping "Score selected" batch. Only affects the plain multi-select
+   *  checkbox, never the Quick Triage one (`onToggleTriage`), which is a
+   *  separate control with its own semantics. */
+  selectDisabled?: boolean;
 }) {
   const ago = agoLabel(age);
   const evaluated = !!scored && (scored.running || scored.score != null);
+  const inTriageReview = triageReason != null;
 
   return (
     <li>
@@ -59,18 +83,25 @@ export function TriageRow({
       onDelete={onDelete}
       className={cn(
         "flex flex-col transition-colors",
-        selected ? "bg-brand-soft/50" : "hover:bg-surface-hover",
+        inTriageReview ? (triageChecked ? "bg-red-500/5" : "bg-surface") : selected ? "bg-brand-soft/50" : "hover:bg-surface-hover",
         evaluated && "opacity-95",
       )}
     >
       <div className="flex items-center gap-2.5 px-3 py-2.5 sm:gap-3 sm:px-4">
-      {/* multi-select — power-user batch to shortlist */}
+      {/* multi-select — power-user batch to shortlist, OR (in a Quick Triage
+          review) "will be archived" — same control, meaning depends on mode. */}
       <input
         type="checkbox"
-        checked={selected}
-        onChange={onToggleSelect}
-        aria-label={`Select ${job.company} ${job.role}`}
-        className="size-4 shrink-0 accent-brand max-sm:min-h-[44px] max-sm:min-w-[24px]"
+        checked={inTriageReview ? !!triageChecked : selected}
+        onChange={inTriageReview ? onToggleTriage : onToggleSelect}
+        disabled={!inTriageReview && selectDisabled}
+        aria-label={inTriageReview ? `Archive ${job.company} ${job.role}` : `Select ${job.company} ${job.role}`}
+        title={!inTriageReview && selectDisabled ? "Already scoring — can't add it to another batch" : undefined}
+        className={cn(
+          "size-4 shrink-0 max-sm:min-h-[44px] max-sm:min-w-[24px]",
+          inTriageReview ? "accent-red-500" : "accent-brand",
+          !inTriageReview && selectDisabled && "cursor-not-allowed opacity-40",
+        )}
       />
 
       <CompanyLogo name={job.company} size={20} />
@@ -83,8 +114,13 @@ export function TriageRow({
           {source && <span className="rounded bg-surface-hover px-1 py-px font-medium text-muted">{ATS_LABEL[source]}</span>}
           {ago && <span>{ago}</span>}
           {/* 🔴 CRUDA: honest "not scored" — no fabricated match%. */}
-          {!evaluated && <span className="italic text-muted">not scored</span>}
+          {!evaluated && !inTriageReview && <span className="italic text-muted">not scored</span>}
         </p>
+        {inTriageReview && (
+          <p className={cn("mt-1 text-xs", triageChecked ? "text-red-600 dark:text-red-400" : "text-muted")}>
+            {triageChecked ? `Flagged: ${triageReason}` : "Kept — deselected from the discard batch"}
+          </p>
+        )}
       </div>
 
       {/* EVALUADA state — compact badge, stays inline (not space-hungry like the 3 buttons) */}
@@ -131,7 +167,7 @@ export function TriageRow({
               <button
                 type="button"
                 onClick={onSave}
-                title={shortlisted ? "In your shortlist" : "Save to shortlist"}
+                title={labels?.saveTitle ?? (shortlisted ? "In your shortlist" : "Save to shortlist")}
                 aria-pressed={shortlisted}
                 className={cn(
                   "inline-flex items-center justify-center gap-1 rounded-md px-2 py-1 text-xs font-medium transition-colors min-h-[44px] min-w-[44px]",
@@ -139,12 +175,12 @@ export function TriageRow({
                 )}
               >
                 {shortlisted ? <BookmarkCheck className="size-4" /> : <Bookmark className="size-4" />}
-                <span className="max-sm:hidden">{shortlisted ? "Saved" : "Save"}</span>
+                <span className="max-sm:hidden">{labels?.save ?? (shortlisted ? "Saved" : "Save")}</span>
               </button>
               <button
                 type="button"
                 onClick={onSkip}
-                title="Skip — hide from the inbox"
+                title={labels?.skipTitle ?? "Skip — hide from the inbox"}
                 className="inline-flex items-center justify-center rounded-md p-1 text-faint transition-colors hover:bg-surface-hover hover:text-foreground min-h-[44px] min-w-[44px]"
               >
                 <X className="size-4" />

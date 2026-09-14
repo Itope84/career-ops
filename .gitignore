@@ -116,7 +116,17 @@ package-lock.json
 plan/
 
 # Web
-.career-ops-web/logo-cache/
+# Entire web-app runtime dir: logo cache, durable job registry, and the
+# AI run/cover transcripts. All regenerated at runtime, and the absolute
+# paths inside the transcripts trip test-all.mjs's tracked-file path check.
+.career-ops-web/
 # Timestamped safety backups (profile.yml.bak-<ISO>, applications.md.bak-<ISO>, …)
 # The bare "*.bak" above does NOT match these — they end in a timestamp, not ".bak".
 *.bak-*
+
+# Rendered JD text cached at scan time (jd-capture.mjs) — scraped content.
+data/jd-cache/
+
+# Local one-off experiment scripts — hardcoded absolute paths, not part of the
+# system layer (test-all.mjs flags absolute paths in tracked files).
+scratch/
