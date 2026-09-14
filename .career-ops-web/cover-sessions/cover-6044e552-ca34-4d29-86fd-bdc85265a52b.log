@@ -1,0 +1,3 @@
+2026-09-07T13:53:59.746Z spawn turn (0 prior) cli=opencode bin=/opt/homebrew/bin/opencode
+2026-09-07T13:55:01.258Z exit code=0 signal=null · 6291 chars
+2026-09-07T13:55:01.261Z committed phase=collect status=awaiting-input
