@@ -133,3 +133,7 @@ data/jd-cache/
 # Local one-off experiment scripts — hardcoded absolute paths, not part of the
 # system layer (test-all.mjs flags absolute paths in tracked files).
 scratch/
+
+# Editor swap files — one of these was committed once already.
+*.swp
+*.swo
