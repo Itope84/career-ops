@@ -122,14 +122,22 @@ function dealBreakers(profile) {
   const minComp = profile.compensation.minimum;
   const locationFlex = profile.compensation.location_flexibility;
   const visaStatus = profile.location.visa_status;
+  // The country the candidate can ALREADY work in without sponsorship, from
+  // this instance's own profile. Previously both parentheticals below hardcoded
+  // the UK, which silently inverted the rule for a non-UK candidate: an
+  // Ireland-based candidate was told to reject right-to-work requirements
+  // "other than the UK", i.e. UK-only roles — the very ones needing sponsorship
+  // — were explicitly PROTECTED from rejection, contradicting the
+  // location_flexibility/visa_status prose sitting right next to it.
+  const homeCountry = profile.location?.country || 'the candidate\'s home country';
   return `CANDIDATE TARGETS:
 The candidate is targeting these specific archetypes. The job must align with at least one:
 ${archetypes}
 
 HARD DEAL-BREAKERS (Reject if the JD violates ANY of these):
-1. Location: ${locationFlex} (Reject if it is a US-only remote role).
+1. Location: ${locationFlex} (Reject if the role is remote but restricted to a country the line above does not allow.)
 2. Compensation: If a salary is explicitly stated and the MAXIMUM of their advertised band is strictly below ${minComp}, reject. (If the salary is unadvertised/undisclosed, DO NOT reject).
-3. Visa/Sponsorship: ${visaStatus}. (Reject if the role explicitly requires existing right-to-work in a country other than the UK, e.g., "Must be a US Citizen").
+3. Visa/Sponsorship: ${visaStatus}. The candidate can work WITHOUT sponsorship in ${homeCountry} only. Reject if the role requires existing right-to-work / citizenship in any OTHER country (e.g. "Must have the right to work in the US", "Must be a US Citizen") UNLESS the posting says sponsorship is offered/available. Treat silence on sponsorship for a role outside ${homeCountry} as "no sponsorship", and reject.
 4. False Friends / Skill Mismatch: Reject if the role is primarily quota-carrying B2B Sales (e.g. Account Executive), heavy software engineering (coding), or requires specialized licenses/certifications the candidate clearly lacks (e.g., medical, legal, chartered accounting).${language ? `\n${language}` : ''}${seniority ? `\n${seniority}` : ''}`;
 }
 

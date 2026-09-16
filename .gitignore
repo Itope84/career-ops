@@ -10,6 +10,9 @@ data/pipeline.md
 data/scan-history.tsv
 data/scan-runs.tsv
 data/blacklist.md
+# Pre-screen discard trail (archive-pipeline-entries.mjs) — job URLs the
+# candidate rejected, with reasons. User data, never system layer.
+data/discard.log
 data/pdf-index.tsv
 data/agent-inbox.md
 data/active-interviews.md

@@ -41,10 +41,34 @@ export function BroadSearchButton() {
       .catch(() => {});
   }, []);
 
-  const job = jobs.find((j) => j.id === jobId);
+  // The broad search this button is showing. Looking up by the locally-held
+  // `jobId` alone was the bug: both `jobId` and `phase` are component state, so
+  // navigating away and back remounts with jobId=null and phase="idle" — the
+  // spinner vanished and the button re-enabled while the run was still going,
+  // which is exactly the "state doesn't survive leaving the page" this was
+  // supposed to have fixed. The durable registry already knows (the job store
+  // adopts unknown running jobs from GET /api/jobs), so fall back to the most
+  // recent scan-broad job in the store rather than trusting local memory.
+  const latestBroad = jobs
+    .filter((j) => j.kind === "scan-broad")
+    .sort((a, b) => b.startedAt - a.startedAt)[0];
+  const job = jobs.find((j) => j.id === jobId) ?? latestBroad;
+
+  // Re-adopt a run that outlived this component, so the button comes back
+  // disabled + spinning instead of idle.
+  useEffect(() => {
+    if (jobId || !latestBroad || latestBroad.status !== "running") return;
+    setJobId(latestBroad.id);
+    setPhase("running");
+  }, [jobId, latestBroad]);
 
   useEffect(() => {
     if (!job) return;
+    // Only announce a FINISH we were actually watching. Without this, the
+    // fallback above would surface an old completed run on every mount —
+    // flashing "Done" and firing router.refresh() for a search that ended
+    // hours ago. Adoption (above) deliberately only takes `running` jobs.
+    if (job.id !== jobId) return;
     if (job.status === "done") {
       setPhase("done");
       router.refresh();

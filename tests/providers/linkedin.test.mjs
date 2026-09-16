@@ -50,8 +50,14 @@ try {
   const rawHref =
     'https://ie.linkedin.com/jobs/view/marketing-executive-at-arcon-recruitment-ireland-4465021485?position=1&amp;pageNum=0&amp;refId=abc%3D%3D&amp;trackingId=def%3D%3D';
   const canon = canonicalizeLinkedInUrl(rawHref);
-  if (canon === 'https://ie.linkedin.com/jobs/view/marketing-executive-at-arcon-recruitment-ireland-4465021485') {
-    pass('canonicalizeLinkedInUrl() decodes entities and strips tracking query params');
+  // The fixture href is ie.linkedin.com and the expected result is www: the
+  // provider normalises LinkedIn's country subdomain. Searching never used the
+  // country host (SEARCH_BASE is pinned to www and ALLOWED_HOST throws on
+  // anything else) — the country host only ever appeared in the RESULT
+  // permalinks, and both hosts serve the identical posting (verified live on an
+  // Irish job: same role, same location, same JD text, byte-for-byte length).
+  if (canon === 'https://www.linkedin.com/jobs/view/marketing-executive-at-arcon-recruitment-ireland-4465021485') {
+    pass('canonicalizeLinkedInUrl() decodes entities, strips tracking params and normalises the country host to www');
   } else {
     fail(`canonicalizeLinkedInUrl() returned ${canon}`);
   }
@@ -134,7 +140,7 @@ try {
     j0?.title === 'Marketing Executive' &&
     j0?.company === 'Arcon Recruitment Ireland' &&
     j0?.location === 'County Mayo, Ireland' &&
-    j0?.url === 'https://ie.linkedin.com/jobs/view/marketing-executive-at-arcon-recruitment-ireland-4465021485'
+    j0?.url === 'https://www.linkedin.com/jobs/view/marketing-executive-at-arcon-recruitment-ireland-4465021485'
   ) {
     pass('parseLinkedInSearchHtml() extracts title/company/location/url correctly');
   } else {
@@ -170,6 +176,21 @@ try {
     if (/0 job cards parsed/.test(err.message)) pass('fetch() throws a clear error on a zero-cards response');
     else fail(`fetch() threw an unexpected error: ${err.message}`);
   }
+  // posted_within_days → f_TPR (the ONE filter the guest endpoint honours;
+  // f_WT/f_E/f_JT and every sort param were verified live to be ignored).
+  const tpr = buildLinkedInUrl({ keywords: 'X', location: 'UK', posted_within_days: 5 });
+  if (tpr.includes('f_TPR=r432000')) pass('buildLinkedInUrl() maps posted_within_days to f_TPR seconds');
+  else fail(`buildLinkedInUrl() posted_within_days => ${tpr}`);
+
+  const noTpr = [
+    buildLinkedInUrl({ keywords: 'X', posted_within_days: 0 }),
+    buildLinkedInUrl({ keywords: 'X', posted_within_days: -3 }),
+    buildLinkedInUrl({ keywords: 'X', posted_within_days: 'soon' }),
+    buildLinkedInUrl({ keywords: 'X' }),
+  ];
+  if (noTpr.every((u) => !u.includes('f_TPR'))) pass('buildLinkedInUrl() omits f_TPR for absent/zero/negative/non-numeric values');
+  else fail(`buildLinkedInUrl() emitted f_TPR for an invalid value: ${noTpr.join(' | ')}`);
+
 } catch (err) {
   fail(`linkedin provider test crashed: ${err.message}`);
 }

@@ -18,7 +18,7 @@ import { atomicWrite } from "@/lib/core/safe-write";
 // closed tab just looked like "connection lost" forever, even though a report
 // was sitting on disk. This registry is that durable landing spot.
 
-export type JobKind = "evaluate" | "pdf" | "research" | "fix-portal" | "scan-broad" | "scan" | "triage";
+export type JobKind = "evaluate" | "pdf" | "research" | "fix-portal" | "scan-broad" | "scan" | "scan-ats-full" | "triage";
 /** "queued" = accepted and durable, but waiting for a concurrency slot before
  *  its CLI child is spawned (see job-queue.ts). Distinct from "running" so the
  *  UI can say "waiting" instead of showing 99 identical spinners. */

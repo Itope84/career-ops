@@ -21,6 +21,16 @@ export function sourceFromUrl(url: string): AtsSource | null {
   if (domainIs("lever.co")) return "lever";
   if (domainIs("ashbyhq.com")) return "ashby";
   if (domainIs("myworkdayjobs.com") || domainIs("workday.com")) return "workday";
+  // Discovery-only boards: not directories the reverse scanner can walk, but
+  // they are where most rows actually come from, and a row with no tag reads as
+  // a missing tag rather than as "not an ATS".
+  if (domainIs("linkedin.com")) return "linkedin";
+  if (domainIs("irishjobs.ie")) return "irishjobs";
+  if (domainIs("jobs.ie")) return "jobsie";
+  if (domainIs("workable.com")) return "workable";
+  if (domainIs("smartrecruiters.com")) return "smartrecruiters";
+  if (domainIs("personio.com") || domainIs("personio.de")) return "personio";
+  if (domainIs("teamtailor.com")) return "teamtailor";
   return null;
 }
 

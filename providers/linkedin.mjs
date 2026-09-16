@@ -60,14 +60,21 @@
 // may vary by market density). If a real pagination mechanism is confirmed
 // live later, this is the place to add it.
 //
-// NO DATE/OTHER FILTER PARAMS: public write-ups of this endpoint document
-// additional guest-search query params (e.g. a posted-within filter, remote
-// toggle, experience level). None of those were tested against the live
-// endpoint in this session, so none are wired in here — only `keywords` and
-// `location`, both confirmed live above. Posting-age filtering already
-// happens downstream via scan.mjs's `max_posting_age_days` against the
-// `postedAt` this provider does expose (parsed from each card's real
-// `datetime` attribute, not a relative "N days ago" string).
+// FILTER PARAMS — exactly ONE works (re-tested live 2026-09-15 by comparing
+// returned job IDs, since counts never move: page size is a fixed 10):
+//   - f_TPR (date posted) — HONOURED. r86400 shared 1/8 IDs with the
+//     unfiltered baseline, r604800 shared 3/9. Wired up as the entry's
+//     `posted_within_days` (see buildLinkedInUrl).
+//   - f_WT (remote), f_E (experience), f_JT (job type), and a speculative
+//     company-size param — ALL IGNORED, byte-identical result sets. There is
+//     no company-size facet on LinkedIn job search to begin with.
+//   - Sorting is ignored too: sortBy=DD, sortBy=R and f_SB2=DD each returned
+//     identical IDs in identical order.
+// Since there is no pagination either, narrowing the date window is the only
+// lever on WHAT comes back in the one page this provider gets. Posting-age
+// filtering still ALSO happens downstream via scan.mjs's
+// `max_posting_age_days` against the `postedAt` this provider exposes (parsed
+// from each card's real `datetime` attribute, not a relative "N days ago").
 //
 // Wire in via a `job_boards:` entry with `provider: linkedin`.
 
@@ -117,6 +124,26 @@ export function buildLinkedInUrl(entry) {
 
   const params = new URLSearchParams({ keywords });
   if (location) params.set('location', location);
+  // `posted_within_days` → LinkedIn's f_TPR=r<seconds> "date posted" facet.
+  //
+  // This is the ONLY filter the guest endpoint honours. Verified live by
+  // comparing returned job IDs (not counts — page size is fixed at 10, so
+  // counts never move): f_TPR=r86400 shared 1/8 IDs with the unfiltered
+  // baseline and f_TPR=r604800 shared 3/9, while f_WT (remote), f_E
+  // (experience), f_JT (job type) and a speculative company-size param all
+  // returned byte-identical result sets — silently ignored. Sorting is ignored
+  // too (sortBy=DD / sortBy=R / f_SB2=DD gave identical IDs in identical
+  // order), so narrowing the window is the only way to steer what comes back.
+  //
+  // Why it matters: this provider gets ONE page per entry with no pagination
+  // (see the file header), so the result window is a fixed, small budget.
+  // Narrowing to recent postings spends that budget on fresh roles instead of
+  // stale ones. Age filtering still ALSO happens downstream in scan.mjs via
+  // `max_posting_age_days`; this just stops the window being wasted first.
+  const days = Number(entry?.posted_within_days);
+  if (Number.isFinite(days) && days > 0) {
+    params.set('f_TPR', `r${Math.round(days * 86_400)}`);
+  }
   return `${SEARCH_BASE}?${params.toString()}`;
 }
 
@@ -125,6 +152,19 @@ export function buildLinkedInUrl(entry) {
  * trackingId) off a job card's href, leaving a clean URL that's stable across
  * calls for the same posting — confirmed live (see file header). Returns null
  * for anything that doesn't parse as an absolute https URL.
+ *
+ * Also normalises LinkedIn's COUNTRY subdomain to `www`. LinkedIn returns a
+ * host that follows the search location — uk.linkedin.com here,
+ * ie.linkedin.com for an Ireland search — for what is the same posting and the
+ * same content. Two reasons to collapse them:
+ *   1. Dedup: the same job reached via two searches would otherwise be two
+ *      different URLs in scan-history/pipeline.
+ *   2. iOS: tapping a job opened the LinkedIn app from one instance but not
+ *      another. Both hosts serve a byte-identical apple-app-site-association
+ *      claiming /jobs/view/*, so the difference isn't the AASA — it's that iOS
+ *      caches the "open in Safari" choice PER DOMAIN. Pinning every link to one
+ *      host means one preference to get right instead of one per country.
+ * Verified: the path is identical across hosts, so only the host changes.
  *
  * @param {string} rawHref
  * @returns {string | null}
@@ -138,6 +178,7 @@ export function canonicalizeLinkedInUrl(rawHref) {
     return null;
   }
   if (parsed.protocol !== 'https:') return null;
+  if (/^[a-z]{2}\.linkedin\.com$/i.test(parsed.hostname)) parsed.hostname = 'www.linkedin.com';
   return `${parsed.origin}${parsed.pathname}`;
 }
 

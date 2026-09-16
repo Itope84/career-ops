@@ -1180,9 +1180,9 @@ async function parallelFetch(tasks, limit) {
  *      enhancement, and a scan must never fail because it couldn't cache a JD.
  */
 async function captureJdsFor(offers) {
-  let saveJd, hasJd;
+  let saveJd, hasJd, fetchLinkedInJd, linkedInJobId;
   try {
-    ({ saveJd, hasJd } = await import('./jd-capture.mjs'));
+    ({ saveJd, hasJd, fetchLinkedInJd, linkedInJobId } = await import('./jd-capture.mjs'));
   } catch {
     return; // capture is best-effort; never break a scan over it
   }
@@ -1211,6 +1211,36 @@ async function captureJdsFor(offers) {
     }
   }
 
+  // LinkedIn before the browser: its public job page truncates the description
+  // behind "see more" and shows guests a sign-in interstitial, so rendering it
+  // captures a partial JD at best. The guest jobPosting endpoint returns the
+  // full description as plain HTML with no login — one cheap GET, no browser.
+  // Only reached for offers that already survived filtering + dedup, so this
+  // stays low-volume (see fetchLinkedInJd's note on why it is not in the
+  // provider). Throttled like the render loop: same host, same IP.
+  let viaLinkedIn = 0;
+  if (typeof fetchLinkedInJd === 'function' && typeof linkedInJobId === 'function') {
+    const liOffers = needRender.filter((o) => linkedInJobId(o.url));
+    if (liOffers.length > 0) {
+      let jitteredDelayMs, sleep;
+      try {
+        ({ jitteredDelayMs, sleep } = await import('./liveness-browser.mjs'));
+      } catch { /* pacing helpers unavailable — fall through unthrottled below */ }
+      for (let i = 0; i < liOffers.length; i++) {
+        const offer = liOffers[i];
+        const text = await fetchLinkedInJd(offer.url);
+        if (text && saveJd(offer.url, text, { source: 'linkedin-guest', company: offer.company, role: offer.title })) {
+          viaLinkedIn++;
+          const at = needRender.indexOf(offer);
+          if (at !== -1) needRender.splice(at, 1);
+        }
+        if (i < liOffers.length - 1 && sleep && jitteredDelayMs) {
+          await sleep(jitteredDelayMs(JD_CAPTURE_THROTTLE_MS));
+        }
+      }
+    }
+  }
+
   let rendered = 0;
   let blocked = 0;
   if (needRender.length > 0) {
@@ -1219,7 +1249,7 @@ async function captureJdsFor(offers) {
       ({ chromium } = await import('playwright'));
       ({ newLivenessPage, jitteredDelayMs, sleep } = await import('./liveness-browser.mjs'));
     } catch {
-      console.log(`JD capture: ${free} free, ${alreadyCached} already cached, ${needRender.length} skipped (Playwright unavailable)`);
+      console.log(`JD capture: ${free} free, ${viaLinkedIn} linkedin-guest, ${alreadyCached} already cached, ${needRender.length} skipped (Playwright unavailable)`);
       return;
     }
     let browser;
@@ -1252,7 +1282,7 @@ async function captureJdsFor(offers) {
     }
   }
   console.log(
-    `JD capture: ${free + rendered} newly cached (${free} free, ${rendered} rendered), ` +
+    `JD capture: ${free + rendered + viaLinkedIn} newly cached (${free} free, ${viaLinkedIn} linkedin-guest, ${rendered} rendered), ` +
       `${alreadyCached} already cached, ${blocked} unavailable`,
   );
 }
@@ -1475,13 +1505,21 @@ async function main() {
       const resolved = resolveProvider(entry, providers);
       if (!resolved) {
         skippedCount++;
-        if (entry.scan_method === 'websearch') {
-          agentHandoff.push({
-            company: entry.name,
-            method: 'websearch',
-            query: entry.scan_query || entry.search_query || entry.careers_url || '',
-          });
-        }
+        // Name every unresolved company, not just the websearch ones. A company
+        // no provider claims is precisely the agent's Level 1 (browse) work,
+        // and previously it vanished into skippedCount — a bare number the
+        // agent could not act on, leaving it to infer the target set from a
+        // missing `api:` field. That inference is wrong here: every provider
+        // auto-detects from `careers_url`, so entries with no `api:` are
+        // usually resolved anyway. Listing them makes the handoff explicit.
+        const websearch = entry.scan_method === 'websearch';
+        agentHandoff.push({
+          company: entry.name,
+          method: websearch ? 'websearch' : 'browse',
+          query: websearch
+            ? (entry.scan_query || entry.search_query || entry.careers_url || '')
+            : (entry.careers_url || ''),
+        });
         continue;
       }
 
@@ -1824,6 +1862,11 @@ async function main() {
     if (agentHandoff.length > 25) {
       console.log(`  … ${agentHandoff.length - 25} more omitted; narrow with --company or inspect portals.yml`);
     }
+  } else {
+    // Say so explicitly. An agent reading this output needs to tell "every
+    // company was covered by a zero-token provider" apart from "the handoff
+    // section is missing", and silence reads as the latter.
+    console.log('Agent/WebSearch handoff: none — every tracked company resolved to a zero-token provider');
   }
 
   const unreachableTargets = errors.filter((e) => e.kind === 'slug_gone');

@@ -66,16 +66,27 @@ export function ConfigForm() {
       .then((d) => {
         const list: Cli[] = d.clis ?? [];
         setClis(list);
-        // auto-select if nothing chosen yet — same preference order as the
-        // server default in clis.ts: Antigravity → Claude → first installed
-        setCliId(
-          (prev) =>
-            prev ||
-            list.find((c) => c.installed && c.id === "antigravity")?.id ||
+        // Preference order lives HERE as well as in clis.ts's DEFAULT_ORDER —
+        // two copies that drifted apart: the server default was changed to
+        // OpenCode while this copy still put Antigravity first, so the picker
+        // kept re-selecting Antigravity no matter what the server said. Keep
+        // the two in sync, or better, delete one of them.
+        //
+        // A restored value is also re-validated rather than trusted: a cliId
+        // saved in this browser months ago can name an engine that has since
+        // been uninstalled or removed from the list, and keeping it would
+        // leave the picker on an entry that no longer exists and fail every
+        // run with an unresolvable engine.
+        setCliId((prev) => {
+          const stillValid = prev && list.some((c) => c.id === prev && c.installed);
+          if (stillValid) return prev;
+          return (
+            list.find((c) => c.installed && c.id === "opencode")?.id ||
             list.find((c) => c.installed && c.id === "claude")?.id ||
             list.find((c) => c.installed)?.id ||
-            "",
-        );
+            ""
+          );
+        });
       })
       .catch(() => setClis([]));
   }, []);

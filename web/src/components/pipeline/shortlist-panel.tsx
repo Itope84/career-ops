@@ -5,7 +5,7 @@ import { useRouter } from "next/navigation";
 import { Sparkles } from "lucide-react";
 import { useJobs } from "@/components/jobs/job-store";
 import { TriageRow, type RowScore } from "@/components/inbox/triage-row";
-import { sourceFromUrl } from "@/lib/inbox";
+import { daysSince, sourceFromUrl } from "@/lib/inbox";
 import type { ShortlistItem, InboxJob } from "@/lib/career-ops";
 
 // The Shortlist tab — replaces what used to be the ALL tab (every tracker row,
@@ -36,6 +36,8 @@ import type { ShortlistItem, InboxJob } from "@/lib/career-ops";
 export function ShortlistPanel({ items }: { items: ShortlistItem[] }) {
   const { jobs, startJob } = useJobs();
   const router = useRouter();
+  // stable "now" for freshness (per mount), same as the inbox
+  const now = useMemo(() => Date.now(), []);
   const [busy, setBusy] = useState<Set<string>>(() => new Set());
   const [selected, setSelected] = useState<Set<string>>(() => new Set());
   const [error, setError] = useState<string | null>(null);
@@ -159,9 +161,19 @@ export function ShortlistPanel({ items }: { items: ShortlistItem[] }) {
 
       <ul className="mt-3 divide-y divide-border overflow-hidden rounded-2xl border border-border bg-surface/40">
         {items.map((it) => {
-          // TriageRow speaks InboxJob; a shortlist bullet carries the same three
-          // fields, so this is a shape adapter, not new data.
-          const job: InboxJob = { url: it.url, company: it.company, role: it.role, done: false };
+          // TriageRow speaks InboxJob; a shortlist bullet now carries location
+          // too (4th column), and postedAt is joined from scan-history by
+          // pipelineSummary() exactly as it is for the inbox — so this stays a
+          // shape adapter, and the card shows the same location/age/source the
+          // inbox showed before the role was bookmarked.
+          const job: InboxJob = {
+            url: it.url,
+            company: it.company,
+            role: it.role,
+            location: it.location,
+            postedAt: it.postedAt,
+            done: false,
+          };
           const disabled = busy.has(it.url);
           const running = !!scoreByUrl.get(it.url)?.running;
           return (
@@ -169,7 +181,7 @@ export function ShortlistPanel({ items }: { items: ShortlistItem[] }) {
               key={it.url}
               job={job}
               source={sourceFromUrl(it.url)}
-              age={null}
+              age={daysSince(it.postedAt, now)}
               scored={scoreByUrl.get(it.url)}
               selected={selected.has(it.url)}
               shortlisted

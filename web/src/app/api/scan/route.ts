@@ -1,6 +1,8 @@
 import { spawn } from "node:child_process";
 import fs from "node:fs";
+import { randomUUID } from "node:crypto";
 import { careerOpsRoot, rootScript } from "@/lib/career-ops";
+import { registerJob, updateJob } from "@/lib/core/run-registry";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -21,7 +23,16 @@ let scanning = false;
 const ADDED_RE = /New offers added:\s+(\d+)/;
 const COMPANIES_RE = /Companies scanned:\s+(\d+)/;
 
-export async function POST() {
+export async function POST(req: Request) {
+  // Body is optional (existing callers with no body still work) — id lets the
+  // client reconcile this run against the durable registry by the SAME id it
+  // shows locally, same convention as /api/run.
+  let body: { id?: string } = {};
+  try {
+    body = await req.json();
+  } catch {
+    /* no body sent — fine, we generate our own id below */
+  }
   if (!fs.existsSync(rootScript("scan"))) {
     return new Response(
       JSON.stringify({ error: "This needs a complete career-ops checkout (scan.mjs). CAREER_OPS_ROOT has data only." }),
@@ -45,8 +56,13 @@ export async function POST() {
   const child = spawn(process.execPath, [rootScript("scan")], { cwd: careerOpsRoot(), env: process.env });
   const enc = new TextEncoder();
 
+  const jobId = typeof body.id === "string" && body.id.trim() ? body.id.trim() : randomUUID();
+  registerJob({ id: jobId, kind: "scan", title: "AI Search", input: "portals.yml" });
+
   let closed = false;
+  let finished = false; // guards the registry write specifically — see /api/run's same pattern
   let killer: ReturnType<typeof setTimeout> | undefined;
+  let killedByTimeout = false;
   const stream = new ReadableStream<Uint8Array>({
     start(controller) {
       let outBuf = "";
@@ -54,11 +70,28 @@ export async function POST() {
       let companies: number | null = null;
       let errTail = "";
       killer = setTimeout(() => {
+        killedByTimeout = true;
         try { child.kill("SIGTERM"); } catch { /* ignore */ }
       }, 300_000);
       const send = (obj: unknown) => {
         if (closed) return;
         try { controller.enqueue(enc.encode(JSON.stringify(obj) + "\n")); } catch { closed = true; }
+      };
+      const finishDone = (addedN: number, companiesN: number | null) => {
+        if (finished) return;
+        finished = true;
+        send({ type: "done", added: addedN, companies: companiesN });
+        updateJob(jobId, { status: "done", endedAt: Date.now(), subtitle: `${addedN} new${companiesN != null ? ` · ${companiesN} companies` : ""}` });
+      };
+      const finishError = (msg: string) => {
+        if (finished) return;
+        finished = true;
+        send({ type: "error", msg });
+        updateJob(jobId, {
+          status: killedByTimeout ? "timeout" : "error",
+          endedAt: Date.now(),
+          error: killedByTimeout ? "Timed out after 300s — the scan didn't finish in time." : msg,
+        });
       };
       const close = () => {
         if (!closed) {
@@ -87,18 +120,18 @@ export async function POST() {
         errTail = (errTail + d.toString()).slice(-500);
       });
       child.on("error", (e) => {
-        send({ type: "error", msg: e.message });
+        finishError(e.message);
         close();
       });
       child.on("close", (code) => {
         if (code === 0 && added != null) {
-          send({ type: "done", added, companies });
+          finishDone(added, companies);
         } else if (code === 0) {
           // Ran clean but the summary line never appeared — surface it honestly
           // instead of claiming "0 new" off an unparsed run.
-          send({ type: "error", msg: "Scan finished but the summary couldn't be read — check the terminal output." });
+          finishError("Scan finished but the summary couldn't be read — check the terminal output.");
         } else {
-          send({ type: "error", msg: errTail.trim().slice(0, 300) || `scan.mjs exited with code ${code}` });
+          finishError(errTail.trim().slice(0, 300) || `scan.mjs exited with code ${code}`);
         }
         close();
       });

@@ -16,6 +16,7 @@ export async function GET() {
     applications: s.applications,
     root: s.root,
     rootExists: s.rootExists,
+    shortlist: s.shortlist,
   });
 }
 

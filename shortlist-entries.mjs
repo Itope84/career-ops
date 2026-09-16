@@ -10,7 +10,8 @@
  * so a "saved" role still showed up in the inbox — exactly the bug this
  * project's own inbox UX kept hitting.
  *
- * Shortlisted entries are plain bullets (`- {url} | {company} | {role}`),
+ * Shortlisted entries are plain bullets
+ * (`- {url} | {company} | {role} | {location?}`),
  * deliberately NOT `- [ ]`/`- [x]` checkboxes: career-ops.ts's readInbox()
  * sweeps every checkbox line in the WHOLE file regardless of section, so a
  * checkbox-style shortlist entry would leak straight back into the inbox and
@@ -116,6 +117,10 @@ async function main() {
       }
       entry.company = it.company;
       entry.role = it.role;
+      // Optional 4th column, mirroring the inbox line shape. Before this the
+      // bullet carried only url|company|role, so bookmarking a role silently
+      // DROPPED its location and the shortlist card had nothing to show.
+      if (typeof it.location === 'string' && it.location.trim()) entry.location = it.location.trim();
     }
     items.push(entry);
   }
@@ -195,7 +200,13 @@ async function main() {
         (wasInPending.has(it.url) ? moved : alreadyThere).push(it.url);
       }
       // Newest first, matching how this file's other sections read.
-      shortlist.body.unshift(...items.map((it) => `- ${it.url} | ${it.company} | ${it.role}`));
+      shortlist.body.unshift(
+        ...items.map((it) =>
+          it.location
+            ? `- ${it.url} | ${it.company} | ${it.role} | ${it.location}`
+            : `- ${it.url} | ${it.company} | ${it.role}`,
+        ),
+      );
     }
 
     writeFileAtomic(PIPELINE_PATH, serialize(preamble, sections));

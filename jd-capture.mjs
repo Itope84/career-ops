@@ -109,6 +109,113 @@ export function hasJd(url) {
   return existsSync(jdPathFor(url));
 }
 
+/** A LinkedIn job-view URL → its numeric posting id, else null. */
+export function linkedInJobId(url) {
+  const m = /^https:\/\/[a-z.]*linkedin\.com\/jobs\/view\/(?:[^/?#]*-)?(\d{6,})(?:[/?#]|$)/i.exec(String(url ?? ''));
+  return m ? m[1] : null;
+}
+
+/**
+ * Fetch a LinkedIn posting's description via the public guest endpoint.
+ *
+ * Why this exists: the linkedin provider parses only the SEARCH CARDS (title,
+ * company, location, url, postedAt) — it never had the description, so every
+ * LinkedIn posting fell through to the Playwright render path below. That is
+ * both slower and worse here: the public job page truncates the description
+ * behind a "see more" control and shows guests a sign-in interstitial, so what
+ * the renderer captured was partial at best.
+ *
+ * `jobs-guest/jobs/api/jobPosting/<id>` returns the full description as plain
+ * HTML with no login (verified live: HTTP 200, ~67KB, description__text
+ * present). One cheap GET, no browser.
+ *
+ * Volume note: this is called from scan.mjs's captureJdsFor(), which runs ONLY
+ * over offers that already survived title/location filtering and dedup — a
+ * handful per run, not the whole result page. Do not move it into the provider
+ * and run it per search hit: the provider deliberately makes one request per
+ * configured entry per scan, and LinkedIn rate-limits by IP.
+ *
+ * @param {string} url
+ * @returns {Promise<string>} description text, or '' if unavailable
+ */
+export async function fetchLinkedInJd(url, { timeoutMs = 15_000, fetchImpl = fetch } = {}) {
+  const id = linkedInJobId(url);
+  if (!id) return '';
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), timeoutMs);
+  try {
+    const res = await fetchImpl(`https://www.linkedin.com/jobs-guest/jobs/api/jobPosting/${id}`, {
+      headers: {
+        'user-agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'accept-language': 'en',
+      },
+      redirect: 'follow',
+      signal: ac.signal,
+    });
+    if (!res.ok) return '';
+    return htmlToText(descriptionSection(await res.text()));
+  } catch {
+    return ''; // never let a JD fetch fail a scan
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * Narrow the page to just the description container.
+ *
+ * The full guest page carries a lot of chrome the JD must not inherit — "Join
+ * or sign in to find your next job", applicant counts, the sign-in modal. Fed
+ * to scoring, that text reads as part of the role. LinkedIn wraps the real
+ * description in `.description__text`, so slice to it and fall back to the
+ * whole document only if the class is ever renamed.
+ */
+function descriptionSection(html) {
+  if (typeof html !== 'string') return '';
+  const start = html.search(/<div[^>]*class="[^"]*description__text[^"]*"/i);
+  if (start === -1) return html;
+  // Cut at the "show more" control that closes the description block; that
+  // marker sits immediately after the JD body on every posting checked.
+  const rest = html.slice(start);
+  // Cut BEFORE the opening tag, not inside it — slicing at the class name left
+  // a dangling `<button class="` on the end of every capture.
+  const end = rest.search(/<button[^>]*show-more-less-html__button|<\/section>/i);
+  return end === -1 ? rest : rest.slice(0, end);
+}
+
+/** Minimal HTML → text: drop scripts/styles, turn block ends into newlines. */
+function htmlToText(html) {
+  if (typeof html !== 'string') return '';
+  return decodeHtmlEntities(
+    html
+      .replace(/<(script|style)\b[^>]*>[\s\S]*?<\/\1>/gi, ' ')
+      .replace(/<br\s*\/?>/gi, '\n')
+      .replace(/<\/(p|div|li|h[1-6]|tr|section)>/gi, '\n')
+      .replace(/<li\b[^>]*>/gi, '• ')
+      .replace(/<[^>]+>/g, ' '),
+  );
+}
+
+/**
+ * The entities LinkedIn's markup actually emits. Currency symbols are NOT
+ * optional here: a UK/EU posting writes its salary as `&pound;100,000` or
+ * `&euro;`, and leaving those raw would hand the salary parser "pound;100,000".
+ */
+function decodeHtmlEntities(s) {
+  return s
+    .replace(
+      /&(amp|lt|gt|quot|#39|apos|nbsp|hellip|mdash|ndash|rsquo|lsquo|ldquo|rdquo|pound|euro|yen|cent|copy|reg|trade|deg|frac12|middot|bull|times);/g,
+      (_, e) => ({
+        amp: '&', lt: '<', gt: '>', quot: '"', '#39': "'", apos: "'", nbsp: ' ',
+        hellip: '…', mdash: '—', ndash: '–', rsquo: '’', lsquo: '‘', ldquo: '“', rdquo: '”',
+        pound: '£', euro: '€', yen: '¥', cent: '¢', copy: '©', reg: '®', trade: '™',
+        deg: '°', frac12: '½', middot: '·', bull: '•', times: '×',
+      })[e] ?? _,
+    )
+    .replace(/&#(\d+);/g, (_, n) => String.fromCodePoint(Number(n)))
+    .replace(/&#x([0-9a-f]+);/gi, (_, n) => String.fromCodePoint(parseInt(n, 16)));
+}
+
 function normalizeText(text) {
   if (typeof text !== 'string') return '';
   return text

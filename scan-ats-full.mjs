@@ -38,6 +38,7 @@ import greenhouse from './providers/greenhouse.mjs';
 import lever from './providers/lever.mjs';
 import ashby from './providers/ashby.mjs';
 import workday from './providers/workday.mjs';
+import bamboohr from './providers/bamboohr.mjs';
 import { buildTitleFilter, buildLocationFilter, loadSeenUrls, appendToPipeline, appendToScanHistory } from './scan.mjs';
 import { SEED_SOURCES, toPortalEntry } from './seeds/vc-portfolios.mjs';
 
@@ -110,6 +111,34 @@ const SOURCES = {
         h => h === `${tenant}.${instance}.myworkdayjobs.com` && h.endsWith('.myworkdayjobs.com'),
       );
     },
+  },
+  // 11,316 tenants — the second-largest directory the dataset publishes, and
+  // the provider already existed (yinkops tracks RNIB and British Red Cross
+  // through it). Dataset entries are bare tenant slugs, same shape as
+  // greenhouse/lever/ashby.
+  //
+  // OPT-IN ONLY (`--ats bamboohr`), deliberately excluded from the default set.
+  // BambooHR's public `/careers/list` payload has NO date field of any kind
+  // (verified against the live API: id, jobOpeningName, departmentId,
+  // departmentLabel, employmentStatusLabel, employmentType, location,
+  // atsLocation, isRemote, locationType — and nothing else). Two consequences:
+  //   1. Every posting is "undated", so a default run drops all of them — 1,074
+  //      dropped from a 200-company sample. Useful output needs
+  //      `--include-undated`, which forfeits this scanner's freshness guarantee.
+  //   2. `location`/`atsLocation` are frequently all-null per tenant, so
+  //      location_filter has nothing to match and cannot exclude anything. A
+  //      200-company sample surfaced explicit "(Canada)" and "(US)" roles that
+  //      would otherwise have been blocked.
+  // In the default set it would flood the pipeline with undateable,
+  // unfilterable postings. Run it on purpose, with --include-undated, and
+  // expect to screen the locations by hand.
+  bamboohr: {
+    optIn: true,
+    provider: bamboohr,
+    dataset: `${DATASET_BASE}/bamboohr_companies.json`,
+    toEntry: (slug) => SLUG_RE.test(String(slug))
+      ? entryOnHost(String(slug), `https://${slug}.bamboohr.com/careers`, h => h === `${slug}.bamboohr.com`)
+      : null,
   },
 };
 
@@ -187,7 +216,7 @@ function parseArgs(argv) {
   // so we don't also walk the full ATS directories unintentionally.
   const ats = atsArg
     ? atsArg.split(',').map(s => s.trim().toLowerCase()).filter(Boolean)
-    : (seeds.length > 0 ? [] : Object.keys(SOURCES));
+    : (seeds.length > 0 ? [] : Object.keys(SOURCES).filter(k => !SOURCES[k].optIn));
   const unknown = ats.filter(a => !SOURCES[a]);
   if (unknown.length) {
     console.error(`Error: unknown ATS source(s): ${unknown.join(', ')}. Valid: ${Object.keys(SOURCES).join(', ')}`);

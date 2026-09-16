@@ -7,7 +7,7 @@ import { useJobs } from "@/components/jobs/job-store";
 import { ClearConfirmModal } from "@/components/clear-confirm-modal";
 import type { InboxJob, ShortlistItem } from "@/lib/career-ops";
 import type { AtsSource } from "@/lib/explore";
-import { ATS_SOURCES } from "@/lib/explore";
+import { ALL_SOURCES } from "@/lib/explore";
 import { daysSince, seniorityFromTitle, sourceFromUrl, SENIORITY_ORDER, type Seniority } from "@/lib/inbox";
 import { FacetChips } from "./facet-chips";
 import { TriageRow, type RowScore } from "./triage-row";
@@ -149,7 +149,7 @@ export function InboxTriage({ inbox, shortlist }: { inbox: InboxJob[]; shortlist
   const availSources = useMemo(() => {
     const set = new Set<AtsSource>();
     for (const e of enriched) if (e.source && !hidden.includes(e.job.url)) set.add(e.source);
-    return ATS_SOURCES.filter((s) => set.has(s));
+    return ALL_SOURCES.filter((s) => set.has(s));
   }, [enriched, hidden]);
   const availSeniorities = useMemo(() => {
     const set = new Set<Seniority>();
@@ -192,7 +192,7 @@ export function InboxTriage({ inbox, shortlist }: { inbox: InboxJob[]; shortlist
     fetch("/api/pipeline/shortlist", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ url: job.url, company: job.company, role: job.role }),
+      body: JSON.stringify({ url: job.url, company: job.company, role: job.role, location: job.location }),
     })
       .then((res) => {
         if (!res.ok) throw new Error("Save failed");
@@ -240,7 +240,7 @@ export function InboxTriage({ inbox, shortlist }: { inbox: InboxJob[]; shortlist
     await fetch("/api/pipeline/shortlist", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ items: add.map((e) => ({ url: e.job.url, company: e.job.company, role: e.job.role })) }),
+      body: JSON.stringify({ items: add.map((e) => ({ url: e.job.url, company: e.job.company, role: e.job.role, location: e.job.location })) }),
     }).catch(() => setDeleteError("Couldn't save those to your shortlist — try again."));
     router.refresh();
   };
@@ -403,11 +403,34 @@ export function InboxTriage({ inbox, shortlist }: { inbox: InboxJob[]; shortlist
     try {
       const res = await fetch("/api/pipeline/archive", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { "Content-Type": "application/json", Accept: "application/json" },
         body: JSON.stringify({ items }),
       });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || "Archive failed");
+      // Read as TEXT first, then parse. res.json() on a non-JSON body throws a
+      // parser error whose message says nothing useful about what went wrong —
+      // on Safari, literally "The string did not match the expected pattern",
+      // which is what this button reported in the wild. A non-JSON body here is
+      // not hypothetical: reached over the Cloudflare tunnel, an expired Access
+      // session answers with an HTML login page, and a request that outlives the
+      // tunnel's timeout (this route holds the pipeline.md lock) answers with an
+      // HTML error page. Both are 2 lines of HTML and a useless exception.
+      const raw = await res.text();
+      let data: { error?: string; archived?: string[]; notFound?: string[] } | null = null;
+      try {
+        data = raw ? JSON.parse(raw) : null;
+      } catch {
+        /* handled below — keep the body for the message */
+      }
+      if (!res.ok || !data) {
+        if (data?.error) throw new Error(data.error);
+        const ct = res.headers.get("content-type") ?? "unknown";
+        const looksLikeLogin = /<html/i.test(raw) && /(access|login|sign in)/i.test(raw);
+        throw new Error(
+          looksLikeLogin
+            ? `Archive failed — the server returned a sign-in page (HTTP ${res.status}). Your Cloudflare Access session likely expired; reload and sign in again.`
+            : `Archive failed (HTTP ${res.status}, ${ct})${raw ? `: ${raw.slice(0, 140)}` : ""}`,
+        );
+      }
       dismissTriageReview();
       router.refresh();
     } catch (err) {

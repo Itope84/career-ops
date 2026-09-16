@@ -350,7 +350,11 @@ export function JobsProvider({ children }: { children: React.ReactNode }) {
           }
         };
 
-        const isScan = opts.kind === "scan";
+        // Both zero-token script scans stream the same NDJSON shape and finish
+        // through finishScan — they differ only in endpoint, how long they run
+        // and what the summary counts (new inbox rows vs matched postings).
+        const isAtsFull = opts.kind === "scan-ats-full";
+        const isScan = opts.kind === "scan" || isAtsFull;
         let scanAdded: number | null = null;
         let scanCompanies: number | null = null;
         const finishScan = (status: "done" | "error", lastLabel?: string) => {
@@ -365,11 +369,11 @@ export function JobsProvider({ children }: { children: React.ReactNode }) {
             endedAt: Date.now(),
             steps: lastLabel ? [...j.steps, { kind: "status", label: lastLabel, ts: Date.now() }] : j.steps,
           }));
-          if (status === "done" && typeof window !== "undefined") window.dispatchEvent(new CustomEvent("co-job-done", { detail: { kind: "scan", input: opts.input } }));
+          if (status === "done" && typeof window !== "undefined") window.dispatchEvent(new CustomEvent("co-job-done", { detail: { kind: opts.kind, input: opts.input } }));
         };
 
         try {
-          const res = await fetch(isScan ? "/api/scan" : "/api/run", {
+          const res = await fetch(isAtsFull ? "/api/scan-ats-full" : isScan ? "/api/scan" : "/api/run", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify(isScan ? { id } : { id, kind: opts.kind, input: opts.input, cliId, title: opts.title, subtitle: opts.subtitle }),
@@ -416,6 +420,7 @@ export function JobsProvider({ children }: { children: React.ReactNode }) {
                   if (typeof ev.tokens === "number") doneTokens = ev.tokens;
                   if (typeof ev.costUsd === "number") doneCostUsd = ev.costUsd;
                   if (typeof ev.added === "number") scanAdded = ev.added;
+                  if (typeof ev.matches === "number") scanAdded = ev.matches;
                   if (typeof ev.companies === "number") scanCompanies = ev.companies;
                 } else if (ev.type === "error") {
                   if (isScan) finishScan("error", ev.msg || "Error");

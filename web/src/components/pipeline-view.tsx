@@ -13,6 +13,7 @@ import { InboxTriage } from "@/components/inbox/inbox-triage";
 import { ShortlistPanel } from "@/components/pipeline/shortlist-panel";
 import { ScanButton } from "@/components/scan-button";
 import { BroadSearchButton } from "@/components/broad-search-button";
+import { ScanAtsFullButton } from "@/components/scan-ats-full-button";
 import { cn } from "@/lib/cn";
 
 // INBOX and SHORTLIST are triage surfaces (raw postings, not tracker rows);
@@ -151,6 +152,7 @@ export function PipelineView({
           )}
           <div className="flex flex-wrap items-center gap-2">
             <ScanButton />
+            <ScanAtsFullButton />
             <BroadSearchButton />
           </div>
         </div>

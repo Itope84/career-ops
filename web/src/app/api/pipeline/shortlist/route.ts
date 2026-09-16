@@ -32,7 +32,10 @@ function errorMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
 
-type AddItem = { url: string; company: string; role: string };
+// `location` is optional and passes straight through to shortlist-entries.mjs,
+// which writes it as the bullet's 4th column. Callers that don't know it (an
+// old client, a manual add) simply omit it and the row behaves as before.
+type AddItem = { url: string; company: string; role: string; location?: string };
 
 export async function POST(req: Request) {
   let body: { url?: string; company?: string; role?: string; items?: Array<Partial<AddItem>> };

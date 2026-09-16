@@ -125,6 +125,56 @@ try {
   if (many.jobs.length === 5) pass('normalizeListing respects the max cap');
   else fail(`normalizeListing max => ${many.jobs.length}`);
 
+  // Cross-host links: SmartRecruiters serves the board from careers.* and the
+  // postings from jobs.*, so a same-origin rule dropped every real job. Keep
+  // another host on the same site when it stays in this employer's namespace,
+  // but still drop the vendor's own marketing/support pages.
+  const crossHost = normalizeListing(
+    [
+      { href: 'https://jobs.smartrecruiters.com/Sia/7440001-ml-engineer', label: 'Machine Learning Engineer\nParis, France' },
+      { href: 'https://www.smartrecruiters.com/pricing', label: 'Pricing And Plans' },
+      { href: 'https://www.linkedin.com/company/sia', label: 'Follow Us On LinkedIn' },
+    ],
+    'https://careers.smartrecruiters.com/Sia',
+  );
+  if (crossHost.jobs.length === 1 &&
+      crossHost.jobs[0].url === 'https://jobs.smartrecruiters.com/Sia/7440001-ml-engineer' &&
+      crossHost.jobs[0].title === 'Machine Learning Engineer') {
+    pass('normalizeListing keeps same-site postings in the employer namespace, drops vendor pages');
+  } else {
+    fail(`normalizeListing cross-host => ${JSON.stringify(crossHost.jobs)}`);
+  }
+
+  // A sibling host that shares the site but NOT the namespace is still junk —
+  // this is jobs.lever.co/<company> linking to www.lever.co/job-seeker-support.
+  const sibling = normalizeListing(
+    [
+      { href: 'https://jobs.lever.co/mulberry/abc-123', label: 'Customer Care Advisor\nHYBRID — PERMANENT' },
+      { href: 'https://www.lever.co/job-seeker-support/', label: 'Jobs powered by' },
+    ],
+    'https://jobs.lever.co/mulberry',
+  );
+  if (sibling.jobs.length === 1 && sibling.jobs[0].title === 'Customer Care Advisor') {
+    pass('normalizeListing drops a same-site host outside the employer namespace');
+  } else {
+    fail(`normalizeListing sibling host => ${JSON.stringify(sibling.jobs)}`);
+  }
+
+  // In-page anchors are the "skip to content" links, never postings.
+  const fragments = normalizeListing(
+    [
+      { href: '#st-main', label: 'Skip hero section' },
+      { href: 'https://careers.example.com/Acme#st-footer', label: 'Skip openings section' },
+      { href: '/Acme/9-data-engineer', label: 'Data Engineer' },
+    ],
+    'https://careers.example.com/Acme',
+  );
+  if (fragments.jobs.length === 1 && fragments.jobs[0].title === 'Data Engineer') {
+    pass('normalizeListing drops in-page skip links');
+  } else {
+    fail(`normalizeListing fragments => ${JSON.stringify(fragments.jobs)}`);
+  }
+
 } catch (e) {
   fail(`browser-extract tests crashed: ${e.message}`);
 }

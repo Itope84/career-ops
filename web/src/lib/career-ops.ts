@@ -88,7 +88,7 @@ export function readInbox(): InboxJob[] {
   return jobs;
 }
 
-export type ShortlistItem = { url: string; company: string; role: string };
+export type ShortlistItem = { url: string; company: string; role: string; location?: string; postedAt?: string };
 
 /**
  * Parse data/pipeline.md's `## Shortlisted` section — plain bullets
@@ -106,9 +106,19 @@ export function readShortlist(): ShortlistItem[] {
   const items: ShortlistItem[] = [];
   for (let i = start + 1; i < lines.length; i++) {
     if (/^##\s/.test(lines[i])) break;
-    const m = lines[i].match(/^-\s+(\S+)\s*\|\s*([^|]+)\|\s*(.+)$/);
+    const m = lines[i].match(/^\s*-\s+(.+)$/);
     if (!m) continue;
-    items.push({ url: m[1].trim(), company: m[2].trim(), role: m[3].trim() });
+    // Positional split, same shape as readInbox() minus the checkbox — the
+    // optional 4th `location` column must not bleed into `role`, which the old
+    // greedy `(.+)$` group did (it swallowed "role | location" whole).
+    const parts = m[1].split("|").map((s) => s.trim());
+    if (parts.length < 3 || !parts[0]) continue; // need at least url | company | role
+    items.push({
+      url: parts[0],
+      company: parts[1],
+      role: parts[2],
+      location: parts[3] || undefined,
+    });
   }
   return items;
 }
@@ -241,7 +251,10 @@ export function pipelineSummary(): PipelineSummary {
     // triage view orders/faceted-filters on it entirely client-side.
     inbox: readInbox().map((j) => ({ ...j, postedAt: scanDates.get(j.url) })),
     applications: readApplications(),
-    shortlist: readShortlist(),
+    // Shortlist rows get the same freshness join as the inbox. They were
+    // discovered by the same scan and are in the same history file, so a
+    // bookmarked role had no reason to lose its date on the way in.
+    shortlist: readShortlist().map((s) => ({ ...s, postedAt: scanDates.get(s.url) })),
   };
 }
 

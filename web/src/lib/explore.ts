@@ -4,13 +4,40 @@
 // can never drift between the two halves. Server-only logic (spawning the scanner,
 // writing temp files) lives in lib/core/{scan,portals,pipeline}.ts.
 
-export type AtsSource = "greenhouse" | "lever" | "ashby" | "workday";
+// Where a posting was found. The first four are ATSs the REVERSE scanner can
+// walk; the rest are boards we only ever discover jobs ON, never enumerate
+// company-by-company. Both kinds need a label because job cards tag every row
+// with its origin — before this, an irishjobs/LinkedIn row simply rendered no
+// tag at all, which read as a bug rather than as "not an ATS".
+export type AtsSource =
+  | "greenhouse" | "lever" | "ashby" | "workday"
+  | "linkedin" | "irishjobs" | "jobsie" | "workable" | "smartrecruiters" | "personio" | "teamtailor";
+
+// ONLY the directories scan-ats-full.mjs can enumerate. Explore's --ats picker
+// iterates this, so adding a discovery-only board above must NOT extend it.
 export const ATS_SOURCES: AtsSource[] = ["greenhouse", "lever", "ashby", "workday"];
+
+// Every source a job card can be tagged with, in display order. Used for the
+// inbox's source facet chips — which must offer ALL of them, not just the
+// enumerable four, or a board like LinkedIn gets a tag on the card but no way
+// to filter by it.
+export const ALL_SOURCES: AtsSource[] = [
+  ...ATS_SOURCES,
+  "linkedin", "irishjobs", "jobsie", "workable", "smartrecruiters", "personio", "teamtailor",
+];
+
 export const ATS_LABEL: Record<AtsSource, string> = {
   greenhouse: "Greenhouse",
   lever: "Lever",
   ashby: "Ashby",
   workday: "Workday",
+  linkedin: "LinkedIn",
+  irishjobs: "IrishJobs",
+  jobsie: "Jobs.ie",
+  workable: "Workable",
+  smartrecruiters: "SmartRecruiters",
+  personio: "Personio",
+  teamtailor: "Teamtailor",
 };
 
 /** The full UI filter state. The keyword/location lists mirror scan.mjs's

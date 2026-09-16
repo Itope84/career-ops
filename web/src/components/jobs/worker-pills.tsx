@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { X, History } from "lucide-react";
+import { X, History, AlertTriangle } from "lucide-react";
 import { useJobs } from "@/components/jobs/job-store";
 import { WorkerCard, pillTone, TONE } from "@/components/jobs/worker-card";
 import { cn } from "@/lib/cn";
@@ -12,9 +12,15 @@ export { pillTone, TONE };
 
 // Collapsed "worker" pills in the sidebar — each the shared <WorkerCard> wrapped
 // in a Link to its detail. Same component the assistant chat renders inline.
+//
+// The full tool-by-tool transcript this renders is a debugging surface, not a
+// daily-use one — gated behind DEBUG_ENABLED. Knowing that something FAILED is
+// not a debug concern, though, so a plain failure count still shows (linking
+// to /jobs) even with the flag off — see FailuresIndicator below.
 export function WorkerPills() {
-  const { jobs, removeJob, clearFinished } = useJobs();
+  const { jobs, removeJob, clearFinished, debugEnabled } = useJobs();
   const pathname = usePathname();
+  if (!debugEnabled) return <FailuresIndicator jobs={jobs} />;
   if (jobs.length === 0) return null;
   const running = jobs.filter((j) => j.status === "running").length;
   const finished = jobs.length - running;
@@ -66,6 +72,26 @@ export function WorkerPills() {
           );
         })}
       </ul>
+    </div>
+  );
+}
+
+// Always visible regardless of DEBUG_ENABLED — the point of this whole thing
+// is that a failure (misconfiguration, a spent quota, a CLI that crashed
+// mid-run) never goes unnoticed just because nobody was watching the debug
+// transcript. Renders nothing when there's nothing to report.
+function FailuresIndicator({ jobs }: { jobs: ReturnType<typeof useJobs>["jobs"] }) {
+  const failed = jobs.filter((j) => j.status === "error");
+  if (failed.length === 0) return null;
+  return (
+    <div className="mt-4 border-t border-border pt-3">
+      <Link
+        href="/jobs"
+        className="flex items-center gap-2 rounded-lg border border-red-500/25 bg-red-500/5 px-2.5 py-2 text-xs font-medium text-red-600 transition-colors hover:bg-red-500/10 dark:text-red-400"
+      >
+        <AlertTriangle className="size-3.5 shrink-0" />
+        {failed.length} failed run{failed.length === 1 ? "" : "s"} — view
+      </Link>
     </div>
   );
 }
