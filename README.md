@@ -360,7 +360,20 @@ npm run build:dashboard   # optional: build the standalone binary
 
 Features: 6 filter tabs, 4 sort modes, grouped/flat view, lazy-loaded previews, inline status changes.
 
-There is also an **experimental web UI** (alpha, opt-in — nothing runs unless you start it): see [`web/README.md`](web/README.md).
+There is also an **experimental web UI** (alpha, opt-in — nothing runs unless
+you start it):
+
+```bash
+cd web && npm ci && npm run dev   # http://localhost:3000
+```
+
+It is a local-first *view* over the same files the CLI uses — same pipeline,
+same tracker, same reports — plus a scan/triage/score loop you can drive from a
+phone. It installs as a PWA, and it has **no login of its own**, so put
+authentication in front of it before exposing it beyond localhost.
+
+Setup, the three scan buttons and their very different costs, model routing,
+remote access and troubleshooting: [`web/README.md`](web/README.md).
 
 ## Project Structure
 
